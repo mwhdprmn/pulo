@@ -4,3 +4,5 @@ __pycache__/
 *.tar.gz
 *.zip
 .DS_Store
+anti-slop/
+
