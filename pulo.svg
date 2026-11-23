@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="notchGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#050505"/>
+      <stop offset="100%" stop-color="#111111"/>
+    </linearGradient>
+    <linearGradient id="chartGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <!-- App Icon Base Squircle -->
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+  
+  <!-- Notch Island Silhouette -->
+  <path d="M 28 8 H 100 C 100 8, 96 24, 88 24 H 40 C 32 24, 28 8, 28 8 Z" fill="url(#notchGrad)" stroke="#222" stroke-width="1.5"/>
+  
+  <!-- Camera Lens dot inside notch -->
+  <circle cx="64" cy="15" r="3.5" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <circle cx="64" cy="15" r="1.5" fill="#0284c7"/>
+
+  <!-- Waveform / Mini Indicators inside expanded body -->
+  <!-- Music bars -->
+  <rect x="36" y="52" width="4" height="24" rx="2" fill="#34d399"/>
+  <rect x="44" y="44" width="4" height="32" rx="2" fill="#34d399"/>
+  <rect x="52" y="60" width="4" height="16" rx="2" fill="#34d399"/>
+
+  <!-- Glowing eye / capsule symbol -->
+  <circle cx="78" cy="60" r="14" fill="#0f172a" stroke="#38bdf8" stroke-width="2"/>
+  <ellipse cx="78" cy="60" rx="6" ry="9" fill="#38bdf8"/>
+  <circle cx="80" cy="58" r="2.5" fill="#ffffff"/>
+
+  <!-- Sparkline trend line at bottom -->
+  <path d="M 28 98 L 46 90 L 64 96 L 82 82 L 100 86" fill="none" stroke="url(#chartGrad)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
