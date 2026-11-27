@@ -609,13 +609,16 @@ class BacklightWatcher(threading.Thread):
 
 
 class BluetoothWatcher:
-    """Monitors BlueZ D-Bus signals for device connections & disconnections."""
+    """Monitors BlueZ D-Bus signals for device connections, disconnections & battery levels."""
 
-    def __init__(self, on_event_callback):
+    def __init__(self, on_event_callback, on_battery_callback=None):
         self.on_event_callback = on_event_callback
+        self.on_battery_callback = on_battery_callback
         self._bus = None
         self._sub_id = None
         self._dev_names: Dict[str, str] = {}
+        self._dev_connected: Dict[str, bool] = {}
+        self._dev_batteries: Dict[str, int] = {}
 
     def start(self):
         try:
@@ -663,12 +666,57 @@ class BluetoothWatcher:
                     name = d.get("Alias") or d.get("Name")
                     if name:
                         self._dev_names[path] = str(name)
+                    if "Connected" in d:
+                        self._dev_connected[path] = bool(d["Connected"])
+                if "org.bluez.Battery1" in ifaces:
+                    b = ifaces["org.bluez.Battery1"]
+                    if "Percentage" in b:
+                        self._dev_batteries[path] = max(0, min(100, int(b["Percentage"])))
         except Exception:
             pass
+
+    def _query_battery_pct(self, object_path: str) -> int:
+        if object_path in self._dev_batteries:
+            return self._dev_batteries[object_path]
+        try:
+            if self._bus is not None:
+                res = self._bus.call_sync(
+                    "org.bluez",
+                    object_path,
+                    "org.freedesktop.DBus.Properties",
+                    "Get",
+                    GLib.Variant("(ss)", ("org.bluez.Battery1", "Percentage")),
+                    GLib.VariantType("(v)"),
+                    Gio.DBusCallFlags.NONE,
+                    400,
+                    None,
+                )
+                pct = max(0, min(100, int(res.unpack()[0])))
+                self._dev_batteries[object_path] = pct
+                return pct
+        except Exception:
+            pass
+        return -1
+
+    def get_connected_battery(self) -> Tuple[str, int]:
+        for path, conn in self._dev_connected.items():
+            if conn:
+                name = self._dev_names.get(path, "Perangkat Bluetooth")
+                pct = self._dev_batteries.get(path, -1)
+                if pct >= 0:
+                    return name, pct
+        return "", -1
 
     def _on_prop_changed(self, _conn, _sender, object_path, _iface, _signal, parameters, _data):
         try:
             target_iface, changed, _invalidated = parameters.unpack()
+            if target_iface == "org.bluez.Battery1" and "Percentage" in changed:
+                pct = max(0, min(100, int(changed["Percentage"])))
+                self._dev_batteries[object_path] = pct
+                if self.on_battery_callback:
+                    GLib.idle_add(self.on_battery_callback)
+                return
+
             if target_iface == "org.bluez.Device1":
                 if "Alias" in changed:
                     self._dev_names[object_path] = str(changed["Alias"])
@@ -677,6 +725,7 @@ class BluetoothWatcher:
 
                 if "Connected" in changed:
                     is_connected = bool(changed["Connected"])
+                    self._dev_connected[object_path] = is_connected
                     name = self._dev_names.get(object_path)
                     if not name:
                         try:
@@ -696,7 +745,8 @@ class BluetoothWatcher:
                         except Exception:
                             name = "Perangkat Bluetooth"
 
-                    GLib.idle_add(self.on_event_callback, name, is_connected)
+                    bat_pct = self._query_battery_pct(object_path) if is_connected else -1
+                    GLib.idle_add(self.on_event_callback, name, is_connected, bat_pct)
         except Exception:
             pass
 
@@ -2380,6 +2430,7 @@ class CurrencyItem:
 @dataclass
 class FinanceData:
     ihsg: Optional[StockItem] = None
+    stocks: List[StockItem] = field(default_factory=list)
     currencies: List[CurrencyItem] = field(default_factory=list)
     btc: List[CurrencyItem] = field(default_factory=list)
     last_updated: float = 0.0
@@ -2387,10 +2438,52 @@ class FinanceData:
 
 
 class FinanceManager:
-    """Manages real-time IHSG index and Rupiah currency exchange rates (USD, SGD, EUR) via Yahoo Finance API."""
+    """Manages real-time IHSG index, IDX stock watchlist, Rupiah currency rates, and Crypto via Yahoo Finance & CoinGecko."""
+
+    INDONESIA_STOCK_PRESETS = [
+        ("BBCA.JK", "BBCA"),
+        ("BBRI.JK", "BBRI"),
+        ("BMRI.JK", "BMRI"),
+        ("BBNI.JK", "BBNI"),
+        ("TLKM.JK", "TLKM"),
+        ("ASII.JK", "ASII"),
+        ("GOTO.JK", "GOTO"),
+        ("BREN.JK", "BREN"),
+        ("AMMN.JK", "AMMN"),
+        ("ANTM.JK", "ANTM"),
+        ("UNVR.JK", "UNVR"),
+        ("ICBP.JK", "ICBP"),
+    ]
+
+    CURRENCY_PRESETS = [
+        ("USDIDR=X", "USD/IDR", "Dolar AS"),
+        ("SGDIDR=X", "SGD/IDR", "Dolar SGD"),
+        ("EURIDR=X", "EUR/IDR", "Euro"),
+        ("JPYIDR=X", "JPY/IDR", "Yen"),
+        ("MYRIDR=X", "MYR/IDR", "Ringgit"),
+        ("AUDIDR=X", "AUD/IDR", "Dolar AUD"),
+        ("GBPIDR=X", "GBP/IDR", "Pound"),
+        ("CNYIDR=X", "CNY/IDR", "Yuan"),
+        ("SARIDR=X", "SAR/IDR", "Riyal"),
+    ]
+
+    CRYPTO_PRESETS = [
+        ("bitcoin", "BTC", "BTC-USD"),
+        ("ethereum", "ETH", "ETH-USD"),
+        ("solana", "SOL", "SOL-USD"),
+        ("binancecoin", "BNB", "BNB-USD"),
+        ("ripple", "XRP", "XRP-USD"),
+        ("dogecoin", "DOGE", "DOGE-USD"),
+        ("cardano", "ADA", "ADA-USD"),
+        ("the-open-network", "TON", "TON-USD"),
+    ]
 
     def __init__(self, callback=None):
         self.callback = callback
+        self.show_ihsg: bool = True
+        self.selected_stocks: List[str] = ["BBCA.JK", "BBRI.JK", "TLKM.JK"]
+        self.selected_currencies: List[str] = ["USDIDR=X", "SGDIDR=X", "EURIDR=X"]
+        self.selected_cryptos: List[str] = ["bitcoin"]
         self.data: FinanceData = FinanceData()
         self._load_cache()
         self.fetch_online()
@@ -2442,8 +2535,21 @@ class FinanceManager:
                                 change_pct=float(br.get("change_pct", 0.0)),
                             )
                         )
+                    stocks_list = []
+                    for sr in c.get("stocks", []):
+                        stocks_list.append(
+                            StockItem(
+                                symbol=sr.get("symbol", ""),
+                                name=sr.get("name", ""),
+                                price=float(sr.get("price", 0.0)),
+                                change=float(sr.get("change", 0.0)),
+                                change_pct=float(sr.get("change_pct", 0.0)),
+                                prev_close=float(sr.get("prev_close", 0.0)),
+                            )
+                        )
                     self.data = FinanceData(
                         ihsg=ihsg_item,
+                        stocks=stocks_list,
                         currencies=currs,
                         btc=btcs,
                         last_updated=float(c.get("last_updated", 0.0)),
@@ -2488,10 +2594,21 @@ class FinanceManager:
                     "change": b.change,
                     "change_pct": b.change_pct,
                 })
+            stocks_list = []
+            for s in self.data.stocks:
+                stocks_list.append({
+                    "symbol": s.symbol,
+                    "name": s.name,
+                    "price": s.price,
+                    "change": s.change,
+                    "change_pct": s.change_pct,
+                    "prev_close": s.prev_close,
+                })
             with open(p, "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "ihsg": ihsg_dict,
+                        "stocks": stocks_list,
                         "currencies": curr_list,
                         "btc": btc_list,
                         "last_updated": self.data.last_updated,
@@ -2507,76 +2624,120 @@ class FinanceManager:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             ihsg_item = None
             # 1. Fetch IHSG (^JKSE) - True Daily Change & Sparkline
-            try:
-                # Daily chart range=7d to calculate genuine daily change against yesterday close
-                url_daily = "https://query1.finance.yahoo.com/v8/finance/chart/%5EJKSE?interval=1d&range=7d"
-                req_d = urllib.request.Request(url_daily, headers=headers)
-                with urllib.request.urlopen(req_d, timeout=6) as resp:
-                    raw_d = json.loads(resp.read().decode("utf-8"))
-                    res_d = raw_d["chart"]["result"][0]
-                    meta_d = res_d["meta"]
-                    price = float(meta_d.get("regularMarketPrice", 0.0))
-                    high = float(meta_d.get("regularMarketDayHigh", price))
-                    low = float(meta_d.get("regularMarketDayLow", price))
-                    quotes_d = res_d.get("indicators", {}).get("quote", [{}])[0]
-                    closes_d = [float(c) for c in quotes_d.get("close", []) if c is not None]
-
-                    # True yesterday close is the second to last close in daily series
-                    if len(closes_d) >= 2:
-                        prev = closes_d[-2]
-                    elif meta_d.get("previousClose") is not None:
-                        prev = float(meta_d["previousClose"])
-                    elif closes_d:
-                        prev = closes_d[0]
-                    else:
-                        prev = price
-
-                    if price <= 0.0 and closes_d:
-                        price = closes_d[-1]
-
-                    chg = price - prev
-                    pct = (chg / prev) * 100.0 if prev > 0.0 else 0.0
-
-                # Fetch today intraday points for the mini sparkline chart
-                history_points = []
+            if getattr(self, "show_ihsg", True):
                 try:
-                    url_intra = "https://query1.finance.yahoo.com/v8/finance/chart/%5EJKSE?interval=15m&range=1d"
-                    req_i = urllib.request.Request(url_intra, headers=headers)
-                    with urllib.request.urlopen(req_i, timeout=5) as resp_i:
-                        raw_i = json.loads(resp_i.read().decode("utf-8"))
-                        quotes_i = raw_i["chart"]["result"][0].get("indicators", {}).get("quote", [{}])[0]
-                        history_points = [float(c) for c in quotes_i.get("close", []) if c is not None]
+                    url_daily = "https://query1.finance.yahoo.com/v8/finance/chart/%5EJKSE?interval=1d&range=7d"
+                    req_d = urllib.request.Request(url_daily, headers=headers)
+                    with urllib.request.urlopen(req_d, timeout=6) as resp:
+                        raw_d = json.loads(resp.read().decode("utf-8"))
+                        res_d = raw_d["chart"]["result"][0]
+                        meta_d = res_d["meta"]
+                        price = float(meta_d.get("regularMarketPrice", 0.0))
+                        high = float(meta_d.get("regularMarketDayHigh", price))
+                        low = float(meta_d.get("regularMarketDayLow", price))
+                        quotes_d = res_d.get("indicators", {}).get("quote", [{}])[0]
+                        closes_d = [float(c) for c in quotes_d.get("close", []) if c is not None]
+
+                        if len(closes_d) >= 2:
+                            prev = closes_d[-2]
+                        elif meta_d.get("previousClose") is not None:
+                            prev = float(meta_d["previousClose"])
+                        elif closes_d:
+                            prev = closes_d[0]
+                        else:
+                            prev = price
+
+                        if price <= 0.0 and closes_d:
+                            price = closes_d[-1]
+
+                        chg = price - prev
+                        pct = (chg / prev) * 100.0 if prev > 0.0 else 0.0
+
+                    history_points = []
+                    try:
+                        url_intra = "https://query1.finance.yahoo.com/v8/finance/chart/%5EJKSE?interval=15m&range=1d"
+                        req_i = urllib.request.Request(url_intra, headers=headers)
+                        with urllib.request.urlopen(req_i, timeout=5) as resp_i:
+                            raw_i = json.loads(resp_i.read().decode("utf-8"))
+                            quotes_i = raw_i["chart"]["result"][0].get("indicators", {}).get("quote", [{}])[0]
+                            history_points = [float(c) for c in quotes_i.get("close", []) if c is not None]
+                    except Exception:
+                        pass
+
+                    if not history_points and closes_d:
+                        history_points = closes_d
+
+                    ihsg_item = StockItem(
+                        symbol="^JKSE",
+                        name="IHSG",
+                        price=price,
+                        change=chg,
+                        change_pct=pct,
+                        prev_close=prev,
+                        high=high,
+                        low=low,
+                        history=history_points,
+                    )
+                except Exception:
+                    if self.data and self.data.ihsg:
+                        ihsg_item = self.data.ihsg
+
+            # 1b. Fetch Indonesian Stock Watchlist (IDX)
+            stock_items: List[StockItem] = []
+            stock_syms = list(getattr(self, "selected_stocks", []))[:4]
+            for sym in stock_syms:
+                s_clean = sym.strip().upper()
+                if not s_clean:
+                    continue
+                if not s_clean.endswith(".JK") and not s_clean.startswith("^"):
+                    s_clean = f"{s_clean}.JK"
+                disp_name = s_clean[:-3] if s_clean.endswith(".JK") else s_clean
+                try:
+                    url_s = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(s_clean)}?interval=1d&range=7d"
+                    req_s = urllib.request.Request(url_s, headers=headers)
+                    with urllib.request.urlopen(req_s, timeout=5) as resp_s:
+                        raw_s = json.loads(resp_s.read().decode("utf-8"))
+                        res_s = raw_s["chart"]["result"][0]
+                        meta_s = res_s["meta"]
+                        price_s = float(meta_s.get("regularMarketPrice", 0.0))
+                        quotes_s = res_s.get("indicators", {}).get("quote", [{}])[0]
+                        closes_s = [float(c) for c in quotes_s.get("close", []) if c is not None]
+                        if len(closes_s) >= 2:
+                            prev_s = closes_s[-2]
+                        elif meta_s.get("previousClose") is not None:
+                            prev_s = float(meta_s["previousClose"])
+                        elif closes_s:
+                            prev_s = closes_s[0]
+                        else:
+                            prev_s = price_s
+                        if price_s <= 0.0 and closes_s:
+                            price_s = closes_s[-1]
+                        chg_s = price_s - prev_s
+                        pct_s = (chg_s / prev_s) * 100.0 if prev_s > 0.0 else 0.0
+                        if price_s > 0.0:
+                            stock_items.append(
+                                StockItem(
+                                    symbol=s_clean,
+                                    name=disp_name,
+                                    price=price_s,
+                                    change=chg_s,
+                                    change_pct=pct_s,
+                                    prev_close=prev_s,
+                                )
+                            )
                 except Exception:
                     pass
+            if stock_syms and not stock_items and self.data and self.data.stocks:
+                stock_items = self.data.stocks
 
-                if not history_points and closes_d:
-                    history_points = closes_d
-
-                ihsg_item = StockItem(
-                    symbol="^JKSE",
-                    name="IHSG",
-                    price=price,
-                    change=chg,
-                    change_pct=pct,
-                    prev_close=prev,
-                    high=high,
-                    low=low,
-                    history=history_points,
-                )
-            except Exception:
-                if self.data and self.data.ihsg:
-                    ihsg_item = self.data.ihsg
-
-            # 2. Fetch Currencies (USD/IDR, SGD/IDR, EUR/IDR) - True Daily Change
-            curr_pairs = [
-                ("USDIDR=X", "USD/IDR", "Dolar AS"),
-                ("SGDIDR=X", "SGD/IDR", "Dolar SGD"),
-                ("EURIDR=X", "EUR/IDR", "Euro"),
-            ]
+            # 2. Fetch Selected Currencies
+            preset_curr_map = {s: (p, n) for s, p, n in self.CURRENCY_PRESETS}
+            sel_curr_syms = list(getattr(self, "selected_currencies", ["USDIDR=X", "SGDIDR=X", "EURIDR=X"]))[:4]
             currencies = []
-            for sym, pair_lbl, name_lbl in curr_pairs:
+            for sym in sel_curr_syms:
+                pair_lbl, name_lbl = preset_curr_map.get(sym, (sym.replace("=X", ""), sym))
                 try:
-                    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=7d"
+                    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?interval=1d&range=7d"
                     req = urllib.request.Request(url, headers=headers)
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         raw = json.loads(resp.read().decode("utf-8"))
@@ -2613,72 +2774,101 @@ class FinanceManager:
                 except Exception:
                     pass
 
-            if not currencies and self.data and self.data.currencies:
+            if sel_curr_syms and not currencies and self.data and self.data.currencies:
                 currencies = self.data.currencies
 
-            # 3. Fetch Bitcoin (BTC/IDR & BTC/USD) via CoinGecko (with Yahoo BTC-USD fallback)
+            # 3. Fetch Selected Cryptos via CoinGecko (with Yahoo fallback)
+            crypto_map = {cid: (ticker, ysym) for cid, ticker, ysym in self.CRYPTO_PRESETS}
+            sel_cryptos = [c for c in getattr(self, "selected_cryptos", ["bitcoin"]) if c in crypto_map][:4]
             btc_items = []
-            try:
-                cg_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd,idr&include_24hr_change=true"
-                req_cg = urllib.request.Request(cg_url, headers={"User-Agent": "PuloNotch/1.0"})
-                with urllib.request.urlopen(req_cg, timeout=6) as resp_cg:
-                    cg = json.loads(resp_cg.read().decode("utf-8")).get("bitcoin", {})
-                    idr_p = float(cg.get("idr", 0.0))
-                    idr_pct = float(cg.get("idr_24h_change", 0.0))
-                    usd_p = float(cg.get("usd", 0.0))
-                    usd_pct = float(cg.get("usd_24h_change", 0.0))
-                    if idr_p > 0.0:
-                        btc_items.append(CurrencyItem(
-                            pair="BTC/IDR",
-                            name="Bitcoin (IDR)",
-                            rate=idr_p,
-                            change=idr_p * (idr_pct / 100.0),
-                            change_pct=idr_pct,
-                        ))
-                    if usd_p > 0.0:
-                        btc_items.append(CurrencyItem(
-                            pair="BTC/USD",
-                            name="Bitcoin (USD)",
-                            rate=usd_p,
-                            change=usd_p * (usd_pct / 100.0),
-                            change_pct=usd_pct,
-                        ))
-            except Exception:
-                pass
-
-            if not btc_items:
+            if sel_cryptos:
                 try:
-                    url_b = "https://query1.finance.yahoo.com/v8/finance/chart/BTC-USD?interval=1d&range=7d"
-                    req_b = urllib.request.Request(url_b, headers=headers)
-                    with urllib.request.urlopen(req_b, timeout=5) as resp_b:
-                        raw_b = json.loads(resp_b.read().decode("utf-8"))["chart"]["result"][0]
-                        meta_b = raw_b["meta"]
-                        usd_p = float(meta_b.get("regularMarketPrice", 0.0))
-                        closes_b = [float(c) for c in raw_b.get("indicators", {}).get("quote", [{}])[0].get("close", []) if c is not None]
-                        prev_b = closes_b[-2] if len(closes_b) >= 2 else usd_p
-                        usd_chg = usd_p - prev_b
-                        usd_pct = (usd_chg / prev_b) * 100.0 if prev_b > 0.0 else 0.0
-                        usd_idr_rate = next((c.rate for c in currencies if c.pair == "USD/IDR" and c.rate > 0), 0.0)
-                        if usd_idr_rate > 0.0 and usd_p > 0.0:
-                            idr_p = usd_p * usd_idr_rate
-                            btc_items.append(CurrencyItem(
-                                pair="BTC/IDR", name="Bitcoin (IDR)",
-                                rate=idr_p, change=idr_p * (usd_pct / 100.0), change_pct=usd_pct,
-                            ))
-                        if usd_p > 0.0:
-                            btc_items.append(CurrencyItem(
-                                pair="BTC/USD", name="Bitcoin (USD)",
-                                rate=usd_p, change=usd_chg, change_pct=usd_pct,
-                            ))
+                    ids_str = ",".join(sel_cryptos)
+                    cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_str}&vs_currencies=usd,idr&include_24hr_change=true"
+                    req_cg = urllib.request.Request(cg_url, headers={"User-Agent": "PuloNotch/1.0"})
+                    with urllib.request.urlopen(req_cg, timeout=6) as resp_cg:
+                        cg_all = json.loads(resp_cg.read().decode("utf-8"))
+                        for cid in sel_cryptos:
+                            ticker, _ = crypto_map[cid]
+                            cg = cg_all.get(cid, {})
+                            idr_p = float(cg.get("idr", 0.0))
+                            idr_pct = float(cg.get("idr_24h_change", 0.0))
+                            usd_p = float(cg.get("usd", 0.0))
+                            usd_pct = float(cg.get("usd_24h_change", 0.0))
+                            if len(sel_cryptos) == 1:
+                                if idr_p > 0.0:
+                                    btc_items.append(CurrencyItem(
+                                        pair=f"{ticker}/IDR", name=f"{ticker} (IDR)",
+                                        rate=idr_p, change=idr_p * (idr_pct / 100.0), change_pct=idr_pct,
+                                    ))
+                                if usd_p > 0.0:
+                                    btc_items.append(CurrencyItem(
+                                        pair=f"{ticker}/USD", name=f"{ticker} (USD)",
+                                        rate=usd_p, change=usd_p * (usd_pct / 100.0), change_pct=usd_pct,
+                                    ))
+                            else:
+                                if idr_p > 0.0:
+                                    btc_items.append(CurrencyItem(
+                                        pair=f"{ticker}/IDR", name=f"{ticker} (IDR)",
+                                        rate=idr_p, change=idr_p * (idr_pct / 100.0), change_pct=idr_pct,
+                                    ))
+                                elif usd_p > 0.0:
+                                    btc_items.append(CurrencyItem(
+                                        pair=f"{ticker}/USD", name=f"{ticker} (USD)",
+                                        rate=usd_p, change=usd_p * (usd_pct / 100.0), change_pct=usd_pct,
+                                    ))
                 except Exception:
                     pass
 
-            if not btc_items and self.data and self.data.btc:
-                btc_items = self.data.btc
+                if not btc_items:
+                    usd_idr_rate = next((c.rate for c in currencies if c.pair == "USD/IDR" and c.rate > 0), 0.0)
+                    for cid in sel_cryptos:
+                        ticker, ysym = crypto_map[cid]
+                        try:
+                            url_b = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}?interval=1d&range=7d"
+                            req_b = urllib.request.Request(url_b, headers=headers)
+                            with urllib.request.urlopen(req_b, timeout=5) as resp_b:
+                                raw_b = json.loads(resp_b.read().decode("utf-8"))["chart"]["result"][0]
+                                meta_b = raw_b["meta"]
+                                usd_p = float(meta_b.get("regularMarketPrice", 0.0))
+                                closes_b = [float(c) for c in raw_b.get("indicators", {}).get("quote", [{}])[0].get("close", []) if c is not None]
+                                prev_b = closes_b[-2] if len(closes_b) >= 2 else usd_p
+                                usd_chg = usd_p - prev_b
+                                usd_pct = (usd_chg / prev_b) * 100.0 if prev_b > 0.0 else 0.0
+                                if len(sel_cryptos) == 1:
+                                    if usd_idr_rate > 0.0 and usd_p > 0.0:
+                                        idr_p = usd_p * usd_idr_rate
+                                        btc_items.append(CurrencyItem(
+                                            pair=f"{ticker}/IDR", name=f"{ticker} (IDR)",
+                                            rate=idr_p, change=idr_p * (usd_pct / 100.0), change_pct=usd_pct,
+                                        ))
+                                    if usd_p > 0.0:
+                                        btc_items.append(CurrencyItem(
+                                            pair=f"{ticker}/USD", name=f"{ticker} (USD)",
+                                            rate=usd_p, change=usd_chg, change_pct=usd_pct,
+                                        ))
+                                else:
+                                    if usd_idr_rate > 0.0 and usd_p > 0.0:
+                                        idr_p = usd_p * usd_idr_rate
+                                        btc_items.append(CurrencyItem(
+                                            pair=f"{ticker}/IDR", name=f"{ticker} (IDR)",
+                                            rate=idr_p, change=idr_p * (usd_pct / 100.0), change_pct=usd_pct,
+                                        ))
+                                    elif usd_p > 0.0:
+                                        btc_items.append(CurrencyItem(
+                                            pair=f"{ticker}/USD", name=f"{ticker} (USD)",
+                                            rate=usd_p, change=usd_chg, change_pct=usd_pct,
+                                        ))
+                        except Exception:
+                            pass
 
-            if ihsg_item or currencies or btc_items:
+                if not btc_items and self.data and self.data.btc:
+                    btc_items = self.data.btc
+
+            if ihsg_item or stock_items or currencies or btc_items or not getattr(self, "show_ihsg", True):
                 self.data = FinanceData(
                     ihsg=ihsg_item,
+                    stocks=stock_items,
                     currencies=currencies,
                     btc=btc_items,
                     last_updated=time.time(),
@@ -2898,6 +3088,7 @@ class SystemControlState:
     wifi_ssid: str = ""
     bluetooth_enabled: bool = False
     bluetooth_device: str = ""
+    bluetooth_battery: int = -1
     dnd_enabled: bool = False
     mic_muted: bool = False
     volume: int = 70
@@ -2939,19 +3130,58 @@ class SystemControlManager:
         except Exception:
             pass
 
-        # 2. Bluetooth
+        # 2. Bluetooth & Headset Battery
         bt_on = False
         bt_dev = ""
+        bt_bat = -1
         try:
             b_out = subprocess.check_output(["bluetoothctl", "show"], stderr=subprocess.DEVNULL, timeout=1).decode()
             bt_on = ("Powered: yes" in b_out)
             if bt_on:
                 d_out = subprocess.check_output(["bluetoothctl", "devices", "Connected"], stderr=subprocess.DEVNULL, timeout=1).decode()
                 lines = [l.strip() for l in d_out.splitlines() if l.strip()]
+                bt_mac = ""
                 if lines:
                     parts = lines[0].split(None, 2)
+                    if len(parts) >= 2:
+                        bt_mac = parts[1]
                     if len(parts) >= 3:
                         bt_dev = parts[2]
+                # Query BlueZ org.bluez.Battery1 via D-Bus
+                try:
+                    sys_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+                    if sys_bus is not None:
+                        reply = sys_bus.call_sync(
+                            "org.bluez", "/", "org.freedesktop.DBus.ObjectManager",
+                            "GetManagedObjects", None, GLib.VariantType("(a{oa{sa{sv}}})"),
+                            Gio.DBusCallFlags.NONE, 600, None
+                        )
+                        objs = reply.unpack()[0]
+                        for _p, ifaces in objs.items():
+                            d_if = ifaces.get("org.bluez.Device1")
+                            b_if = ifaces.get("org.bluez.Battery1")
+                            if d_if and b_if and d_if.get("Connected") and "Percentage" in b_if:
+                                bt_bat = max(0, min(100, int(b_if["Percentage"])))
+                                if not bt_dev:
+                                    bt_dev = str(d_if.get("Alias") or d_if.get("Name") or "")
+                                break
+                except Exception:
+                    pass
+                # Fallback: UPower headset / bluetooth battery
+                if bt_bat < 0 and bt_dev and shutil.which("upower"):
+                    try:
+                        up_list = subprocess.check_output(["upower", "-e"], stderr=subprocess.DEVNULL, timeout=1).decode().splitlines()
+                        mac_under = bt_mac.replace(":", "_").lower() if bt_mac else ""
+                        for up_path in up_list:
+                            low_up = up_path.lower()
+                            if ("headset" in low_up or "headphones" in low_up or "bluez" in low_up or (mac_under and mac_under in low_up)):
+                                info = subprocess.check_output(["upower", "-i", up_path], stderr=subprocess.DEVNULL, timeout=1).decode()
+                                m_pct = re.search(r"percentage:\s*(\d+)%", info)
+                                if m_pct:
+                                    bt_bat = max(0, min(100, int(m_pct.group(1))))
+                                    break
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -3055,6 +3285,7 @@ class SystemControlManager:
             self.state.wifi_ssid = wifi_ssid
             self.state.bluetooth_enabled = bt_on
             self.state.bluetooth_device = bt_dev
+            self.state.bluetooth_battery = bt_bat
             self.state.volume = vol
             self.state.volume_muted = vol_muted
             self.state.mic_muted = mic_muted
@@ -3702,19 +3933,28 @@ class NotchRenderer:
         cy: float,
         battery: BatteryState,
         size: float = 17.0,
+        bt_battery: int = -1,
     ):
-        """Donut-shaped battery gauge with percentage or charging bolt inside."""
+        """Donut-shaped battery gauge (dual concentric rings when Bluetooth headset battery is active)."""
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         cap = max(0, min(100, battery.capacity))
+        has_bt = 0 <= bt_battery <= 100
         is_charging = battery.is_charging or (battery.ac_online and not battery.is_full and cap < 99)
         is_full = battery.is_full or (battery.ac_online and cap >= 99)
         is_low = battery.is_low
 
-        if is_full or is_charging or battery.ac_online:
-            accent_col = cls.C_GREEN
-            bg_ring_col = QColor(52, 211, 153, 40)
+        if is_full or is_charging or battery.ac_online or has_bt:
+            if is_low:
+                accent_col = cls.C_RED
+                bg_ring_col = QColor(248, 113, 113, 40)
+            elif cap <= 30 and not (is_charging or battery.ac_online):
+                accent_col = cls.C_AMBER
+                bg_ring_col = QColor(251, 191, 36, 40)
+            else:
+                accent_col = cls.C_GREEN
+                bg_ring_col = QColor(52, 211, 153, 40)
         elif is_low:
             accent_col = cls.C_RED
             bg_ring_col = QColor(248, 113, 113, 40)
@@ -3726,7 +3966,7 @@ class NotchRenderer:
             bg_ring_col = QColor(255, 255, 255, 35)
 
         r = size / 2.0
-        ring_thickness = 2.0
+        ring_thickness = 1.8 if has_bt else 2.0
         rect = QRectF(
             cx - r + ring_thickness / 2.0,
             cy - r + ring_thickness / 2.0,
@@ -3734,29 +3974,47 @@ class NotchRenderer:
             size - ring_thickness,
         )
 
-        # 1. Background ring track
+        # 1. Outer ring track & progress (Laptop Battery)
         p.setPen(QPen(bg_ring_col, ring_thickness, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(rect)
 
-        # 2. Foreground progress arc
         if cap > 0:
             p.setPen(QPen(accent_col, ring_thickness, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             start_angle = 90 * 16
             span_angle = -int((cap / 100.0) * 360 * 16)
             p.drawArc(rect, start_angle, span_angle)
 
+        # 2. Inner concentric ring track & progress (Bluetooth Headset Battery in Sky-Blue)
+        if has_bt:
+            bt_cap = max(0, min(100, bt_battery))
+            inner_thick = 1.6
+            inset = ring_thickness + 1.4
+            inner_size = max(6.0, size - 2.0 * inset)
+            inner_rect = QRectF(
+                cx - inner_size / 2.0,
+                cy - inner_size / 2.0,
+                inner_size,
+                inner_size,
+            )
+            bt_col = cls.C_BLUE if bt_cap > 20 else cls.C_RED
+            bt_bg = QColor(bt_col.red(), bt_col.green(), bt_col.blue(), 40)
+            p.setPen(QPen(bt_bg, inner_thick, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawEllipse(inner_rect)
+            if bt_cap > 0:
+                p.setPen(QPen(bt_col, inner_thick, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawArc(inner_rect, 90 * 16, -int((bt_cap / 100.0) * 360 * 16))
+
         # 3. Donut Center: alternate between lightning bolt & percentage number if charging
         show_bolt = False
         if is_charging:
-            # Alternates every 2 seconds
             show_bolt = ((int(time.time()) // 2) % 2 == 0)
 
         if show_bolt:
-            cls.draw_lightning_bolt(p, cx, cy, size=7.8, color=accent_col)
+            cls.draw_lightning_bolt(p, cx, cy, size=6.8 if has_bt else 7.8, color=accent_col)
         else:
             f_num = QFont("Sans", 6, QFont.Weight.Bold)
-            f_num.setPixelSize(7 if cap < 100 else 6)
+            f_num.setPixelSize(6 if (has_bt or cap >= 100) else 7)
             p.setFont(f_num)
             p.setPen(accent_col)
             p.drawText(
@@ -4878,7 +5136,16 @@ class NotchRenderer:
             )
         elif hud.kind == "bluetooth":
             cls.draw_bluetooth(p, pad_x + 6.0, cy, size=13.0, color=cls.C_BLUE)
-            dev_name = hud.extra_text or "Perangkat Bluetooth"
+            raw_extra = hud.extra_text or "Perangkat Bluetooth"
+            bt_pct = -1
+            if "||" in raw_extra:
+                dev_name, pct_s = raw_extra.rsplit("||", 1)
+                try:
+                    bt_pct = int(pct_s)
+                except Exception:
+                    bt_pct = -1
+            else:
+                dev_name = raw_extra
             connected = not hud.is_muted
             tag_w = 72.0 if connected else 66.0
             tag_rect = QRectF(w - right_pad - tag_w, 5.0, tag_w, 18.0)
@@ -4895,11 +5162,25 @@ class NotchRenderer:
                 "TERHUBUNG" if connected else "TERPUTUS",
             )
 
+            left_limit = tag_rect.left()
+            if connected and 0 <= bt_pct <= 100:
+                bat_txt = f"{bt_pct}%"
+                bat_w = 34.0
+                bat_rect = QRectF(tag_rect.left() - bat_w - 4.0, 5.0, bat_w, 18.0)
+                bat_col = cls.C_GREEN if bt_pct >= 30 else (cls.C_YELLOW if bt_pct >= 15 else cls.C_RED)
+                bat_bg = QColor(bat_col.red(), bat_col.green(), bat_col.blue(), 34)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(bat_bg)
+                p.drawRoundedRect(bat_rect, 5.0, 5.0)
+                p.setPen(bat_col)
+                p.drawText(bat_rect, int(Qt.AlignmentFlag.AlignCenter), bat_txt)
+                left_limit = bat_rect.left()
+
             f_name = QFont("Sans", 9, QFont.Weight.Bold)
             f_name.setPixelSize(11)
             p.setFont(f_name)
             fm = QFontMetricsF(f_name)
-            avail_w = tag_rect.left() - (pad_x + 18.0) - 8.0
+            avail_w = max(40.0, left_limit - (pad_x + 18.0) - 6.0)
             elided = fm.elidedText(dev_name, Qt.TextElideMode.ElideRight, avail_w)
             p.setPen(cls.C_WHITE)
             p.drawText(
@@ -5344,6 +5625,7 @@ class NotchRenderer:
         audio_spectrum: Optional[List[float]] = None,
         privacy: Optional[PrivacyMonitor] = None,
         standby_privacy: bool = True,
+        show_bt_battery: bool = True,
     ) -> QImage:
         hit_boxes.clear()
         is_pill = (island_shape == "pill")
@@ -5508,11 +5790,16 @@ class NotchRenderer:
                 cur_right_x = float(w) - right_pad
 
                 if has_battery:
-                    donut_size = 17.0
+                    bt_bat_val = (
+                        system_ctrl.state.bluetooth_battery
+                        if (show_bt_battery and system_ctrl is not None and system_ctrl.state.bluetooth_enabled and system_ctrl.state.bluetooth_battery >= 0)
+                        else -1
+                    )
+                    donut_size = 18.0 if bt_bat_val >= 0 else 17.0
                     b_x = cur_right_x - donut_size / 2.0
                     item_start_x = cur_right_x - donut_size
                     hit_boxes["standby_battery"] = QRectF(item_start_x - 2.0, 0, donut_size + 4.0, top_h)
-                    cls.draw_battery_donut(p, b_x, cy, battery=battery, size=donut_size)
+                    cls.draw_battery_donut(p, b_x, cy, battery=battery, size=donut_size, bt_battery=bt_bat_val)
                     cur_right_x = item_start_x - item_gap
 
                 if notif_count > 0:
@@ -5681,12 +5968,17 @@ class NotchRenderer:
 
                 # 1. Battery Indicator Donut
                 if has_battery:
-                    donut_size = 17.0
+                    bt_bat_val = (
+                        system_ctrl.state.bluetooth_battery
+                        if (show_bt_battery and system_ctrl is not None and system_ctrl.state.bluetooth_enabled and system_ctrl.state.bluetooth_battery >= 0)
+                        else -1
+                    )
+                    donut_size = 18.0 if bt_bat_val >= 0 else 17.0
                     b_x = cur_right_x - donut_size / 2.0
                     item_start_x = cur_right_x - donut_size
                     if item_start_x >= min_safe_x:
                         hit_boxes["standby_battery"] = QRectF(item_start_x - 2.0, 0, donut_size + 4.0, top_h)
-                        cls.draw_battery_donut(p, b_x, cy, battery=battery, size=donut_size)
+                        cls.draw_battery_donut(p, b_x, cy, battery=battery, size=donut_size, bt_battery=bt_bat_val)
                         cur_right_x = item_start_x - item_gap
 
                 # 2. Active Music Equalizer
@@ -6137,8 +6429,11 @@ class NotchRenderer:
         y_cur = 36.0
 
         fdata = finance.data if finance else None
+        show_ihsg = getattr(finance, "show_ihsg", True) if finance else True
         ihsg = fdata.ihsg if fdata else None
+        stocks = fdata.stocks if fdata else []
         currs = fdata.currencies if fdata else []
+        btcs = fdata.btc if fdata else []
 
         # 1. Header Row: Title "PASAR & KEUANGAN" + Refresh Button + Market Status
         row1_h = 20.0
@@ -6182,162 +6477,190 @@ class NotchRenderer:
         p.setPen(m_col)
         p.drawText(tag_rect, int(Qt.AlignmentFlag.AlignCenter), m_txt)
 
-        # 2. Card 1: IHSG Overview & Sparkline Chart
-        card1_y = y_cur + 22.0
-        card1_h = 84.0
-        card1_rect = QRectF(pad_x, card1_y, inner_w, card1_h)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(cls.C_CARD)
-        p.drawRoundedRect(card1_rect, 10.0, 10.0)
-
+        y_flow = y_cur + 22.0
+        tile_gap = 6.0
         f_name = QFont("Sans", 9, QFont.Weight.Bold)
         f_name.setPixelSize(11)
-        p.setFont(f_name)
-        p.setPen(cls.C_WHITE)
-        p.drawText(QRectF(pad_x + 12.0, card1_y + 6.0, 100.0, 15.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "IHSG (IDX)")
-
         f_desc = QFont("Sans", 8)
         f_desc.setPixelSize(9)
-        p.setFont(f_desc)
-        p.setPen(cls.C_MUTED)
-        p.drawText(QRectF(pad_x + 76.0, card1_y + 7.0, 180.0, 14.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "Indeks Harga Saham Gabungan")
 
-        if ihsg:
-            price_str = f"{ihsg.price:,.2f}"
-            chg = ihsg.change
-            pct = ihsg.change_pct
-            is_up = (chg >= 0)
-            col = cls.C_GREEN if is_up else cls.C_RED
-            chg_str = f"{'▲ +' if is_up else '▼ '}{chg:.2f} ({'+' if is_up else ''}{pct:.2f}%)"
-
-            # Large Price Text
-            f_p = QFont("Sans", 15, QFont.Weight.Bold)
-            f_p.setPixelSize(18)
-            p.setFont(f_p)
-            p.setPen(cls.C_WHITE)
-            fm_p = QFontMetricsF(f_p)
-            pw = fm_p.horizontalAdvance(price_str)
-            p.drawText(QRectF(pad_x + 12.0, card1_y + 21.0, pw + 4.0, 22.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), price_str)
-
-            # Change badge
-            f_c = QFont("Sans", 8, QFont.Weight.Bold)
-            f_c.setPixelSize(10)
-            p.setFont(f_c)
-            fm_c = QFontMetricsF(f_c)
-            cw = fm_c.horizontalAdvance(chg_str) + 10.0
-            badge_r = QRectF(pad_x + 16.0 + pw, card1_y + 23.0, cw, 18.0)
+        # 2. Card 1: IHSG Overview & Sparkline Chart
+        if show_ihsg:
+            card1_h = 74.0
+            card1_rect = QRectF(pad_x, y_flow, inner_w, card1_h)
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(cls.C_GREEN_BG if is_up else cls.C_RED_BG)
-            p.drawRoundedRect(badge_r, 4.0, 4.0)
-            p.setPen(col)
-            p.drawText(badge_r, int(Qt.AlignmentFlag.AlignCenter), chg_str)
+            p.setBrush(cls.C_CARD)
+            p.drawRoundedRect(card1_rect, 10.0, 10.0)
 
-            # Sparkline Chart (if history available)
-            chart_rect = QRectF(pad_x + 12.0, card1_y + 45.0, inner_w - 24.0, 18.0)
-            history = ihsg.history
-            if len(history) >= 2:
-                cls._draw_sparkline(p, chart_rect, history, color=col)
-            else:
+            p.setFont(f_name)
+            p.setPen(cls.C_WHITE)
+            p.drawText(QRectF(pad_x + 12.0, y_flow + 5.0, 100.0, 14.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "IHSG (IDX)")
+
+            p.setFont(f_desc)
+            p.setPen(cls.C_MUTED)
+            p.drawText(QRectF(pad_x + 76.0, y_flow + 6.0, 180.0, 13.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "Indeks Harga Saham Gabungan")
+
+            if ihsg:
+                price_str = f"{ihsg.price:,.2f}"
+                chg = ihsg.change
+                pct = ihsg.change_pct
+                is_up = (chg >= 0)
+                col = cls.C_GREEN if is_up else cls.C_RED
+                chg_str = f"{'▲ +' if is_up else '▼ '}{chg:.2f} ({'+' if is_up else ''}{pct:.2f}%)"
+
+                f_p = QFont("Sans", 15, QFont.Weight.Bold)
+                f_p.setPixelSize(17)
+                p.setFont(f_p)
+                p.setPen(cls.C_WHITE)
+                fm_p = QFontMetricsF(f_p)
+                pw = fm_p.horizontalAdvance(price_str)
+                p.drawText(QRectF(pad_x + 12.0, y_flow + 19.0, pw + 4.0, 20.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), price_str)
+
+                f_c = QFont("Sans", 8, QFont.Weight.Bold)
+                f_c.setPixelSize(10)
+                p.setFont(f_c)
+                fm_c = QFontMetricsF(f_c)
+                cw = fm_c.horizontalAdvance(chg_str) + 10.0
+                badge_r = QRectF(pad_x + 16.0 + pw, y_flow + 20.0, cw, 17.0)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(cls.C_GREEN_BG if is_up else cls.C_RED_BG)
+                p.drawRoundedRect(badge_r, 4.0, 4.0)
+                p.setPen(col)
+                p.drawText(badge_r, int(Qt.AlignmentFlag.AlignCenter), chg_str)
+
+                chart_rect = QRectF(pad_x + 12.0, y_flow + 41.0, inner_w - 24.0, 15.0)
+                history = ihsg.history
+                if len(history) >= 2:
+                    cls._draw_sparkline(p, chart_rect, history, color=col)
+                else:
+                    p.setPen(cls.C_MUTED)
+                    p.drawLine(QPointF(chart_rect.left(), chart_rect.center().y()), QPointF(chart_rect.right(), chart_rect.center().y()))
+
+                f_sub = QFont("Sans", 8)
+                f_sub.setPixelSize(9)
+                p.setFont(f_sub)
                 p.setPen(cls.C_MUTED)
-                p.drawLine(QPointF(chart_rect.left(), chart_rect.center().y()), QPointF(chart_rect.right(), chart_rect.center().y()))
+                stat_txt = f"Tertinggi: {ihsg.high:,.1f}   •   Terendah: {ihsg.low:,.1f}   •   Tutup: {ihsg.prev_close:,.1f}"
+                p.drawText(QRectF(pad_x + 12.0, y_flow + 58.0, inner_w - 24.0, 12.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), stat_txt)
+            else:
+                f_load = QFont("Sans", 9)
+                f_load.setPixelSize(11)
+                p.setFont(f_load)
+                p.setPen(cls.C_MUTED)
+                p.drawText(QRectF(pad_x + 12.0, y_flow + 28.0, 200.0, 20.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "Memuat data IHSG...")
 
-            # Stats line (High, Low, Prev Close)
-            f_sub = QFont("Sans", 8)
-            f_sub.setPixelSize(9)
-            p.setFont(f_sub)
-            p.setPen(cls.C_MUTED)
-            stat_txt = f"Tertinggi: {ihsg.high:,.1f}   •   Terendah: {ihsg.low:,.1f}   •   Penutupan: {ihsg.prev_close:,.1f}"
-            p.drawText(QRectF(pad_x + 12.0, card1_y + 66.0, inner_w - 24.0, 13.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), stat_txt)
-        else:
-            f_load = QFont("Sans", 9)
-            f_load.setPixelSize(11)
-            p.setFont(f_load)
-            p.setPen(cls.C_MUTED)
-            p.drawText(QRectF(pad_x + 12.0, card1_y + 32.0, 200.0, 20.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "Memuat data IHSG...")
+            y_flow += card1_h + 6.0
 
-        # 3. Card 2: Kurs Nilai Tukar Rupiah (3 Tiles: USD, SGD, EUR)
-        card2_y = card1_y + card1_h + 6.0
-        card2_h = 58.0
-        tile_gap = 6.0
-        tile_w = (inner_w - 2.0 * tile_gap) / 3.0
+        # 2b. Card 1b: Indonesian Stock Watchlist (IDX)
+        if stocks:
+            st_items = stocks[:4]
+            st_n = len(st_items)
+            st_w = (inner_w - max(0, st_n - 1) * tile_gap) / st_n
+            st_h = 44.0
+            f_st_p = QFont("Sans", 9, QFont.Weight.Bold)
+            f_st_p.setPixelSize(11)
+            for i, sitem in enumerate(st_items):
+                sx = pad_x + i * (st_w + tile_gap)
+                s_rect = QRectF(sx, y_flow, st_w, st_h)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(cls.C_CARD)
+                p.drawRoundedRect(s_rect, 8.0, 8.0)
 
-        for i, citem in enumerate(currs[:3]):
-            tx = pad_x + i * (tile_w + tile_gap)
-            t_rect = QRectF(tx, card2_y, tile_w, card2_h)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(cls.C_CARD)
-            p.drawRoundedRect(t_rect, 8.0, 8.0)
+                s_up = (sitem.change >= 0)
+                s_col = cls.C_GREEN if s_up else cls.C_RED
+                p.setFont(f_name)
+                p.setPen(cls.C_WHITE)
+                p.drawText(QRectF(sx + 7.0, y_flow + 5.0, st_w - 44.0, 13.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), sitem.name)
 
-            # Currency Title
-            p.setFont(f_name)
-            p.setPen(cls.C_WHITE)
-            p.drawText(QRectF(tx + 8.0, card2_y + 6.0, tile_w - 16.0, 13.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), citem.pair)
+                p.setFont(f_desc)
+                p.setPen(s_col)
+                spct = f"{'+' if s_up else ''}{sitem.change_pct:.1f}%"
+                p.drawText(QRectF(sx + st_w - 44.0, y_flow + 5.0, 37.0, 13.0), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), spct)
 
-            # Rate
+                p.setFont(f_st_p)
+                p.setPen(cls.C_WHITE)
+                p.drawText(QRectF(sx + 7.0, y_flow + 22.0, st_w - 14.0, 15.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), f"Rp {sitem.price:,.0f}")
+            y_flow += st_h + 6.0
+
+        # 3. Card 2: Kurs Nilai Tukar Rupiah
+        if currs:
+            c_items = currs[:4]
+            c_n = len(c_items)
+            card2_h = 52.0
+            tile_w = (inner_w - max(0, c_n - 1) * tile_gap) / c_n
             f_rate = QFont("Sans", 10, QFont.Weight.Bold)
-            f_rate.setPixelSize(12)
-            p.setFont(f_rate)
-            p.setPen(cls.C_WHITE)
-            p.drawText(QRectF(tx + 8.0, card2_y + 23.0, tile_w - 16.0, 15.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), f"Rp {citem.rate:,.0f}")
+            f_rate.setPixelSize(11 if c_n >= 4 else 12)
 
-            # Percentage Change
-            is_up = (citem.change >= 0)
-            col = cls.C_GREEN if is_up else cls.C_RED
-            p.setFont(f_desc)
-            p.setPen(col)
-            pct_s = f"{'+' if is_up else ''}{citem.change_pct:.2f}%"
-            p.drawText(QRectF(tx + 8.0, card2_y + 40.0, tile_w - 16.0, 12.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), pct_s)
+            for i, citem in enumerate(c_items):
+                tx = pad_x + i * (tile_w + tile_gap)
+                t_rect = QRectF(tx, y_flow, tile_w, card2_h)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(cls.C_CARD)
+                p.drawRoundedRect(t_rect, 8.0, 8.0)
 
-        # 4. Card 3: Bitcoin (2 Tiles: BTC/IDR & BTC/USD)
-        btcs = fdata.btc if fdata else []
-        card3_y = card2_y + card2_h + 6.0
-        card3_h = 46.0
-        btc_w = (inner_w - tile_gap) / 2.0
+                p.setFont(f_name)
+                p.setPen(cls.C_WHITE)
+                p.drawText(QRectF(tx + 7.0, y_flow + 5.0, tile_w - 14.0, 13.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), citem.pair)
 
-        for i, bitem in enumerate(btcs[:2]):
-            bx = pad_x + i * (btc_w + tile_gap)
-            b_rect = QRectF(bx, card3_y, btc_w, card3_h)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(cls.C_CARD)
-            p.drawRoundedRect(b_rect, 8.0, 8.0)
+                p.setFont(f_rate)
+                p.setPen(cls.C_WHITE)
+                rate_str = f"Rp {citem.rate:,.2f}" if citem.rate < 500 else f"Rp {citem.rate:,.0f}"
+                p.drawText(QRectF(tx + 7.0, y_flow + 20.0, tile_w - 14.0, 14.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), rate_str)
 
-            # Bitcoin orange badge + pair
-            p.setBrush(QColor(247, 147, 26, 36))
-            p.drawEllipse(QPointF(bx + 15.0, card3_y + 14.0), 6.5, 6.5)
-            f_btc_sym = QFont("Sans", 7, QFont.Weight.Bold)
-            f_btc_sym.setPixelSize(8)
-            p.setFont(f_btc_sym)
-            p.setPen(QColor(247, 147, 26))
-            p.drawText(QRectF(bx + 8.5, card3_y + 7.5, 13.0, 13.0), int(Qt.AlignmentFlag.AlignCenter), "₿")
+                is_up = (citem.change >= 0)
+                col = cls.C_GREEN if is_up else cls.C_RED
+                p.setFont(f_desc)
+                p.setPen(col)
+                pct_s = f"{'+' if is_up else ''}{citem.change_pct:.2f}%"
+                p.drawText(QRectF(tx + 7.0, y_flow + 36.0, tile_w - 14.0, 12.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), pct_s)
+            y_flow += card2_h + 6.0
 
-            p.setFont(f_name)
-            p.setPen(cls.C_WHITE)
-            p.drawText(QRectF(bx + 25.0, card3_y + 7.0, 68.0, 14.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), bitem.pair)
-
-            # 24h % Change on top right
-            b_up = (bitem.change_pct >= 0)
-            b_col = cls.C_GREEN if b_up else cls.C_RED
-            p.setFont(f_desc)
-            p.setPen(b_col)
-            bpct_s = f"{'+' if b_up else ''}{bitem.change_pct:.2f}%"
-            p.drawText(QRectF(bx + btc_w - 58.0, card3_y + 7.0, 50.0, 14.0), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), bpct_s)
-
-            # Price on bottom row
+        # 4. Card 3: Crypto Watchlist
+        if btcs:
+            b_items = btcs[:4]
+            b_n = len(b_items)
+            card3_h = 44.0
+            btc_w = (inner_w - max(0, b_n - 1) * tile_gap) / b_n
             f_brate = QFont("Sans", 10, QFont.Weight.Bold)
-            f_brate.setPixelSize(12)
-            p.setFont(f_brate)
-            p.setPen(cls.C_WHITE)
-            b_price_str = f"Rp {bitem.rate:,.0f}" if "IDR" in bitem.pair else f"$ {bitem.rate:,.0f}"
-            p.drawText(QRectF(bx + 9.0, card3_y + 24.0, btc_w - 18.0, 16.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), b_price_str)
+            f_brate.setPixelSize(11 if b_n >= 3 else 12)
+
+            for i, bitem in enumerate(b_items):
+                bx = pad_x + i * (btc_w + tile_gap)
+                b_rect = QRectF(bx, y_flow, btc_w, card3_h)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(cls.C_CARD)
+                p.drawRoundedRect(b_rect, 8.0, 8.0)
+
+                p.setFont(f_name)
+                p.setPen(QColor(247, 147, 26))
+                p.drawText(QRectF(bx + 7.0, y_flow + 5.0, btc_w - 46.0, 14.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), bitem.pair)
+
+                b_up = (bitem.change_pct >= 0)
+                b_col = cls.C_GREEN if b_up else cls.C_RED
+                p.setFont(f_desc)
+                p.setPen(b_col)
+                bpct_s = f"{'+' if b_up else ''}{bitem.change_pct:.1f}%"
+                p.drawText(QRectF(bx + btc_w - 46.0, y_flow + 5.0, 39.0, 14.0), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), bpct_s)
+
+                p.setFont(f_brate)
+                p.setPen(cls.C_WHITE)
+                if "IDR" in bitem.pair:
+                    if bitem.rate >= 1_000_000:
+                        b_price_str = f"Rp {bitem.rate / 1_000_000:.1f}jt" if b_n >= 3 else f"Rp {bitem.rate:,.0f}"
+                    else:
+                        b_price_str = f"Rp {bitem.rate:,.0f}"
+                else:
+                    b_price_str = f"$ {bitem.rate:,.2f}" if bitem.rate < 100 else f"$ {bitem.rate:,.0f}"
+                p.drawText(QRectF(bx + 7.0, y_flow + 22.0, btc_w - 14.0, 16.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), b_price_str)
+            y_flow += card3_h + 4.0
 
         # 5. Footer Row: Last Updated Timestamp
-        foot_y = card3_y + card3_h + 3.0
         up_time = datetime.datetime.fromtimestamp(fdata.last_updated).strftime("%H:%M") if fdata and fdata.last_updated else "--:--"
         f_foot = QFont("Sans", 8)
         f_foot.setPixelSize(9)
         p.setFont(f_foot)
         p.setPen(cls.C_MUTED)
-        p.drawText(QRectF(pad_x + 4.0, foot_y, inner_w - 8.0, 14.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), f"Diperbarui pukul {up_time} WIB  •  Yahoo Finance & CoinGecko")
+        p.drawText(QRectF(pad_x + 4.0, y_flow, inner_w - 8.0, 14.0), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), f"Diperbarui pukul {up_time} WIB  •  Yahoo Finance & CoinGecko")
 
     @classmethod
     def _draw_panel_area(
@@ -6590,6 +6913,23 @@ class NotchRenderer:
         bat_x = clk_rect.left() - 12.0 - bat_total_w
         bat_pill = QRectF(bat_x - 4.0, header_y + 2.0, bat_total_w + 8.0, 20.0)
         hit_boxes["header_battery"] = bat_pill
+
+        # Bluetooth Headset Battery Pill (to the left of laptop battery if connected)
+        if system_ctrl is not None and system_ctrl.state.bluetooth_enabled and system_ctrl.state.bluetooth_battery >= 0:
+            bt_b = system_ctrl.state.bluetooth_battery
+            bt_txt = f"{bt_b}%"
+            bt_tw = fm_bat.horizontalAdvance(bt_txt)
+            bt_pill_w = 12.0 + bt_tw + 10.0
+            bt_pill_x = bat_pill.left() - bt_pill_w - 4.0
+            if bt_pill_x > tab_bar_rect.right() + 4.0:
+                bt_pill_r = QRectF(bt_pill_x, header_y + 3.0, bt_pill_w, 18.0)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(56, 189, 248, 30))
+                p.drawRoundedRect(bt_pill_r, 5.0, 5.0)
+                cls.draw_bluetooth(p, bt_pill_x + 8.0, header_y + 12.0, size=10.0, color=cls.C_BLUE)
+                p.setFont(f_bat)
+                p.setPen(cls.C_BLUE)
+                p.drawText(QRectF(bt_pill_x + 14.0, header_y + 3.0, bt_tw + 4.0, 18.0), int(Qt.AlignmentFlag.AlignCenter), bt_txt)
 
         # Privacy indicator pill in panel header (to the left of battery)
         if privacy is not None and (privacy.cam_active or privacy.mic_active):
@@ -7658,6 +7998,16 @@ class NotchRenderer:
         p.setFont(f_bold)
         p.setPen(cls.C_WHITE)
         p.drawText(QRectF(bt_x + 45.0, y_top + 8.0, card_w - 50.0, 16.0), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), "Bluetooth")
+        if st.bluetooth_enabled and st.bluetooth_battery >= 0:
+            bt_pct = st.bluetooth_battery
+            bat_col = cls.C_GREEN if bt_pct >= 30 else (cls.C_YELLOW if bt_pct >= 15 else cls.C_RED)
+            bat_pill = QRectF(bt_x + card_w - 38.0, y_top + 8.0, 31.0, 15.0)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(bat_col.red(), bat_col.green(), bat_col.blue(), 32))
+            p.drawRoundedRect(bat_pill, 4.0, 4.0)
+            p.setFont(f_sub)
+            p.setPen(bat_col)
+            p.drawText(bat_pill, int(Qt.AlignmentFlag.AlignCenter), f"{bt_pct}%")
         p.setFont(f_sub)
         p.setPen(cls.C_WHITE_SEC if st.bluetooth_enabled else cls.C_MUTED)
         bt_sub = st.bluetooth_device if (st.bluetooth_enabled and st.bluetooth_device) else ("Aktif" if st.bluetooth_enabled else "Mati")
@@ -7915,183 +8265,308 @@ window.settings-window combobox button {
 window.settings-window switch {
     border-radius: 14px;
 }
+
+window.settings-window .settings-sidebar {
+    background-color: #090d12;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 16px 10px;
+}
+
+window.settings-window .settings-sidebar list {
+    background-color: transparent;
+}
+
+window.settings-window .settings-sidebar row {
+    border-radius: 8px;
+    padding: 9px 10px;
+    margin-bottom: 3px;
+    color: #8b949e;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+window.settings-window .settings-sidebar row:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+    color: #e6edf3;
+}
+
+window.settings-window .settings-sidebar row:selected {
+    background-color: rgba(88, 166, 255, 0.16);
+    color: #58a6ff;
+}
+
+window.settings-window togglebutton.chip-toggle {
+    background-image: none;
+    background-color: #21262d;
+    color: #8b949e;
+    border: 1px solid rgba(240, 246, 252, 0.14);
+    border-radius: 7px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+window.settings-window togglebutton.chip-toggle:hover {
+    background-color: #2d333b;
+    color: #f0f6fc;
+}
+
+window.settings-window togglebutton.chip-toggle:checked {
+    background-image: none;
+    background-color: rgba(52, 211, 153, 0.22);
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.70);
+}
+
+window.settings-window .active-pill {
+    background-color: rgba(52, 211, 153, 0.16);
+    border: 1px solid rgba(52, 211, 153, 0.55);
+    border-radius: 8px;
+    padding: 2px 4px 2px 9px;
+}
+
+window.settings-window .active-pill-label {
+    color: #6ee7b7;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+window.settings-window button.active-pill-remove {
+    background-image: none;
+    background-color: transparent;
+    color: #9ca3af;
+    border: none;
+    border-radius: 5px;
+    padding: 1px 5px;
+    min-width: 18px;
+    min-height: 18px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+window.settings-window button.active-pill-remove:hover {
+    background-color: rgba(248, 113, 113, 0.25);
+    color: #f87171;
+}
+
+window.settings-window button.clear-link-btn {
+    background-image: none;
+    background-color: transparent;
+    color: #f87171;
+    border: none;
+    padding: 2px 6px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+window.settings-window button.clear-link-btn:hover {
+    background-color: rgba(248, 113, 113, 0.14);
+    border-radius: 6px;
+}
+
+window.settings-window .watchlist-warn {
+    color: #fbbf24;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+window.settings-window entry.settings-entry {
+    background-color: #0d1117;
+    color: #f0f6fc;
+    border: 1px solid rgba(240, 246, 252, 0.16);
+    border-radius: 8px;
+    padding: 5px 10px;
+    font-size: 12px;
+}
 """
 
 
 class SettingsWindow(Gtk.Window):
-    """Modern standalone GTK window for configuring Pulo Notch."""
+    """Modern standalone GTK window with sidebar navigation for configuring Pulo Notch."""
+
+    SIDEBAR_ITEMS = [
+        ("standby", "🖥️  Tampilan & Standby"),
+        ("finance", "📈  Keuangan & Watchlist"),
+        ("prayer", "🕌  Sholat & Cuaca"),
+        ("health", "🧘  Kesehatan Kerja"),
+        ("quotes", "💬  Kutipan & Motivasi"),
+        ("bluetooth", "🎧  Bluetooth & Perangkat"),
+        ("system", "⚙️  Integrasi & Sistem"),
+    ]
 
     def __init__(self, controller):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.controller = controller
+        self._fin_refresh_timer = None
         self.set_title("Pengaturan Pulo Notch")
         self.set_role("pulo-settings")
-        self.set_default_size(480, 560)
+        self.set_default_size(740, 560)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.get_style_context().add_class("settings-window")
 
         self.connect("delete-event", self._on_delete_event)
 
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.add(scrolled)
+        root_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.add(root_hbox)
 
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        main_box.get_style_context().add_class("settings-container")
-        scrolled.add(main_box)
+        # Left Sidebar
+        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        sidebar_box.set_size_request(198, -1)
+        sidebar_box.get_style_context().add_class("settings-sidebar")
 
-        # Header Title
-        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title_box.set_margin_start(6)
+        title_box.set_margin_bottom(6)
         h_lbl = Gtk.Label(xalign=0)
         h_lbl.set_markup("<span size='large' weight='bold' color='#f0f6fc'>Pulo Notch</span>")
         sub_lbl = Gtk.Label(xalign=0)
-        sub_lbl.set_markup("<span size='small' color='#8b949e'>Pusat Pengaturan &amp; Personalisasi Dynamic Island</span>")
+        sub_lbl.set_markup("<span size='x-small' color='#8b949e'>Pusat Pengaturan</span>")
         title_box.pack_start(h_lbl, False, False, 0)
         title_box.pack_start(sub_lbl, False, False, 0)
-        main_box.pack_start(title_box, False, False, 4)
+        sidebar_box.pack_start(title_box, False, False, 0)
 
-        # ---------------------------------------------------------
-        # Card 1: Desain & Tampilan Standby (Idle)
-        # ---------------------------------------------------------
-        card1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card1.get_style_context().add_class("settings-card")
+        self.sidebar_list = Gtk.ListBox()
+        self.sidebar_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        for page_id, label_txt in self.SIDEBAR_ITEMS:
+            row = Gtk.ListBoxRow()
+            row._page_id = page_id
+            lbl = Gtk.Label(label=label_txt, xalign=0)
+            row.add(lbl)
+            self.sidebar_list.add(row)
+        sidebar_box.pack_start(self.sidebar_list, True, True, 0)
+        root_hbox.pack_start(sidebar_box, False, False, 0)
 
-        c1_head = Gtk.Label(xalign=0)
-        c1_head.get_style_context().add_class("section-header")
-        c1_head.set_text("DESAIN & TAMPILAN STANDBY")
-        card1.pack_start(c1_head, False, False, 0)
+        # Right Content Stack
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(140)
+        root_hbox.pack_start(self.stack, True, True, 0)
 
-        # Row 0: Island Shape (Notch vs Floating Pill)
-        r0_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r0_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r0_t = Gtk.Label(label="Bentuk Tampilan Island", xalign=0)
-        r0_t.get_style_context().add_class("row-title")
-        r0_d = Gtk.Label(label="Pilih bentuk: MacBook Notch (menempel tepi atas) atau Floating Pill (kapsul melayang)", xalign=0)
-        r0_d.get_style_context().add_class("row-desc")
-        r0_txt.pack_start(r0_t, False, False, 0)
-        r0_txt.pack_start(r0_d, False, False, 0)
-        r0_box.pack_start(r0_txt, True, True, 0)
+        self._build_standby_page()
+        self._build_finance_page()
+        self._build_prayer_page()
+        self._build_health_page()
+        self._build_quotes_page()
+        self._build_bluetooth_page()
+        self._build_system_page()
 
-        self.combo_shape = Gtk.ComboBoxText()
-        self.combo_shape.append("notch", "MacBook Notch")
-        self.combo_shape.append("pill", "Floating Pill")
-        self.combo_shape.set_active_id(getattr(self.controller, "island_shape", "notch"))
-        self.combo_shape.connect("changed", self._on_shape_changed)
-        r0_box.pack_start(self.combo_shape, False, False, 0)
-        card1.pack_start(r0_box, False, False, 2)
+        self.sidebar_list.connect("row-selected", self._on_sidebar_row_selected)
+        first_row = self.sidebar_list.get_row_at_index(0)
+        if first_row:
+            self.sidebar_list.select_row(first_row)
 
-        # Row 1: Standby Animation Mode
-        r1_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r1_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r1_t = Gtk.Label(label="Mode Tampilan Standby", xalign=0)
-        r1_t.get_style_context().add_class("row-title")
-        r1_d = Gtk.Label(label="Pilihan tampilan utama: Animasi atau Jam saja", xalign=0)
-        r1_d.get_style_context().add_class("row-desc")
-        r1_txt.pack_start(r1_t, False, False, 0)
-        r1_txt.pack_start(r1_d, False, False, 0)
-        r1_box.pack_start(r1_txt, True, True, 0)
+        self.show_all()
 
-        self.combo_standby = Gtk.ComboBoxText()
-        self.combo_standby.append("eyes", "Animasi")
-        self.combo_standby.append("clock", "Jam Aja")
+    def _on_sidebar_row_selected(self, _listbox, row):
+        if row is not None and hasattr(row, "_page_id"):
+            self.stack.set_visible_child_name(row._page_id)
+            if row._page_id == "bluetooth":
+                self._update_bt_status_label()
+
+    @staticmethod
+    def _make_scrolled_page() -> Tuple[Gtk.ScrolledWindow, Gtk.Box]:
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.get_style_context().add_class("settings-container")
+        scrolled.add(box)
+        return scrolled, box
+
+    @staticmethod
+    def _make_card(title: str) -> Gtk.Box:
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        card.get_style_context().add_class("settings-card")
+        head = Gtk.Label(xalign=0)
+        head.get_style_context().add_class("section-header")
+        head.set_text(title)
+        card.pack_start(head, False, False, 0)
+        return card
+
+    @staticmethod
+    def _make_switch_row(parent: Gtk.Box, title: str, desc: str, active: bool, callback) -> Gtk.Switch:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        t_lbl = Gtk.Label(label=title, xalign=0)
+        t_lbl.get_style_context().add_class("row-title")
+        d_lbl = Gtk.Label(label=desc, xalign=0)
+        d_lbl.get_style_context().add_class("row-desc")
+        d_lbl.set_line_wrap(True)
+        txt.pack_start(t_lbl, False, False, 0)
+        txt.pack_start(d_lbl, False, False, 0)
+        row.pack_start(txt, True, True, 0)
+        sw = Gtk.Switch()
+        sw.set_valign(Gtk.Align.CENTER)
+        sw.set_active(active)
+        sw.connect("notify::active", callback)
+        row.pack_start(sw, False, False, 0)
+        parent.pack_start(row, False, False, 2)
+        return sw
+
+    @staticmethod
+    def _make_combo_row(parent: Gtk.Box, title: str, desc: str, items: List[Tuple[str, str]], active_id: str, callback) -> Gtk.ComboBoxText:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        t_lbl = Gtk.Label(label=title, xalign=0)
+        t_lbl.get_style_context().add_class("row-title")
+        d_lbl = Gtk.Label(label=desc, xalign=0)
+        d_lbl.get_style_context().add_class("row-desc")
+        d_lbl.set_line_wrap(True)
+        txt.pack_start(t_lbl, False, False, 0)
+        txt.pack_start(d_lbl, False, False, 0)
+        row.pack_start(txt, True, True, 0)
+        combo = Gtk.ComboBoxText()
+        combo.set_valign(Gtk.Align.CENTER)
+        for item_id, item_lbl in items:
+            combo.append(item_id, item_lbl)
+        combo.set_active_id(active_id)
+        combo.connect("changed", callback)
+        row.pack_start(combo, False, False, 0)
+        parent.pack_start(row, False, False, 2)
+        return combo
+
+    def _build_standby_page(self):
+        scrolled, page = self._make_scrolled_page()
+        card1 = self._make_card("DESAIN & TAMPILAN STANDBY")
+
+        self.combo_shape = self._make_combo_row(
+            card1,
+            "Bentuk Tampilan Island",
+            "MacBook Notch (menempel tepi atas) atau Floating Pill (kapsul melayang)",
+            [("notch", "MacBook Notch"), ("pill", "Floating Pill")],
+            getattr(self.controller, "island_shape", "notch"),
+            self._on_shape_changed,
+        )
         if self.controller.standby_display not in ("eyes", "clock"):
             self.controller.standby_display = "clock"
-        self.combo_standby.set_active_id(self.controller.standby_display)
-        self.combo_standby.connect("changed", self._on_standby_changed)
-        r1_box.pack_start(self.combo_standby, False, False, 0)
-        card1.pack_start(r1_box, False, False, 2)
+        self.combo_standby = self._make_combo_row(
+            card1,
+            "Mode Tampilan Standby",
+            "Pilihan tampilan utama: Animasi atau Jam saja",
+            [("eyes", "Animasi"), ("clock", "Jam Aja")],
+            self.controller.standby_display,
+            self._on_standby_changed,
+        )
+        self.switch_weather = self._make_switch_row(
+            card1, "Cuaca di Sisi Kanan Notch", "Suhu & ikon cuaca di sayap kanan saat standby",
+            self.controller.standby_weather, self._on_weather_switch_toggled
+        )
+        self.switch_battery = self._make_switch_row(
+            card1, "Persentase Baterai di Standby", "Indikator donat baterai dengan angka persen & animasi charger",
+            self.controller.standby_battery, self._on_battery_switch_toggled
+        )
+        self.switch_lyrics = self._make_switch_row(
+            card1, "Lirik Musik di Standby (Live Karaoke)", "Tampilkan lirik lagu berjalan di notch saat memutar musik",
+            getattr(self.controller, "standby_lyrics", True), self._on_lyrics_switch_toggled
+        )
+        self.switch_finance = self._make_switch_row(
+            card1, "Info IHSG di Standby", "Pergerakan naik/turun IHSG di sisi kanan notch saat santai",
+            getattr(self.controller, "standby_finance", True), self._on_finance_switch_toggled
+        )
+        self.switch_privacy = self._make_switch_row(
+            card1, "Indikator Privasi Kamera & Mikrofon", "Titik hijau/oranye saat kamera atau mikrofon aktif dipakai aplikasi",
+            getattr(self.controller, "standby_privacy", True), self._on_privacy_switch_toggled
+        )
 
-        # Row 2: Weather on Standby Switch
-        r2_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r2_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r2_t = Gtk.Label(label="Cuaca di Sisi Kanan Notch", xalign=0)
-        r2_t.get_style_context().add_class("row-title")
-        r2_d = Gtk.Label(label="Suhu & ikon cuaca di sayap kanan saat standby", xalign=0)
-        r2_d.get_style_context().add_class("row-desc")
-        r2_txt.pack_start(r2_t, False, False, 0)
-        r2_txt.pack_start(r2_d, False, False, 0)
-        r2_box.pack_start(r2_txt, True, True, 0)
-
-        self.switch_weather = Gtk.Switch()
-        self.switch_weather.set_valign(Gtk.Align.CENTER)
-        self.switch_weather.set_active(self.controller.standby_weather)
-        self.switch_weather.connect("notify::active", self._on_weather_switch_toggled)
-        r2_box.pack_start(self.switch_weather, False, False, 0)
-        card1.pack_start(r2_box, False, False, 2)
-
-        # Row 3: Battery Donut on Standby Switch
-        r_bat_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r_bat_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r_bat_t = Gtk.Label(label="Persentase Baterai di Standby", xalign=0)
-        r_bat_t.get_style_context().add_class("row-title")
-        r_bat_d = Gtk.Label(label="Indikator donat baterai dengan angka persen & animasi charger", xalign=0)
-        r_bat_d.get_style_context().add_class("row-desc")
-        r_bat_txt.pack_start(r_bat_t, False, False, 0)
-        r_bat_txt.pack_start(r_bat_d, False, False, 0)
-        r_bat_box.pack_start(r_bat_txt, True, True, 0)
-
-        self.switch_battery = Gtk.Switch()
-        self.switch_battery.set_valign(Gtk.Align.CENTER)
-        self.switch_battery.set_active(self.controller.standby_battery)
-        self.switch_battery.connect("notify::active", self._on_battery_switch_toggled)
-        r_bat_box.pack_start(self.switch_battery, False, False, 0)
-        card1.pack_start(r_bat_box, False, False, 2)
-
-        # Row 4: Live Karaoke Lyrics on Standby Switch
-        r_lyr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r_lyr_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r_lyr_t = Gtk.Label(label="Lirik Musik di Standby (Live Karaoke)", xalign=0)
-        r_lyr_t.get_style_context().add_class("row-title")
-        r_lyr_d = Gtk.Label(label="Tampilkan lirik lagu berjalan di notch saat memutar musik", xalign=0)
-        r_lyr_d.get_style_context().add_class("row-desc")
-        r_lyr_txt.pack_start(r_lyr_t, False, False, 0)
-        r_lyr_txt.pack_start(r_lyr_d, False, False, 0)
-        r_lyr_box.pack_start(r_lyr_txt, True, True, 0)
-
-        self.switch_lyrics = Gtk.Switch()
-        self.switch_lyrics.set_valign(Gtk.Align.CENTER)
-        self.switch_lyrics.set_active(getattr(self.controller, "standby_lyrics", True))
-        self.switch_lyrics.connect("notify::active", self._on_lyrics_switch_toggled)
-        r_lyr_box.pack_start(self.switch_lyrics, False, False, 0)
-        card1.pack_start(r_lyr_box, False, False, 2)
-
-        # Row 5: Finance / IHSG on Standby Switch
-        r_fin_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r_fin_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r_fin_t = Gtk.Label(label="Info IHSG di Standby", xalign=0)
-        r_fin_t.get_style_context().add_class("row-title")
-        r_fin_d = Gtk.Label(label="Pergerakan naik/turun IHSG di sisi kanan notch saat santai", xalign=0)
-        r_fin_d.get_style_context().add_class("row-desc")
-        r_fin_txt.pack_start(r_fin_t, False, False, 0)
-        r_fin_txt.pack_start(r_fin_d, False, False, 0)
-        r_fin_box.pack_start(r_fin_txt, True, True, 0)
-
-        self.switch_finance = Gtk.Switch()
-        self.switch_finance.set_valign(Gtk.Align.CENTER)
-        self.switch_finance.set_active(getattr(self.controller, "standby_finance", True))
-        self.switch_finance.connect("notify::active", self._on_finance_switch_toggled)
-        r_fin_box.pack_start(self.switch_finance, False, False, 0)
-        card1.pack_start(r_fin_box, False, False, 2)
-
-        # Row 5b: Camera & Mic Privacy Indicator Switch
-        r_priv_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r_priv_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r_priv_t = Gtk.Label(label="Indikator Privasi Kamera & Mikrofon", xalign=0)
-        r_priv_t.get_style_context().add_class("row-title")
-        r_priv_d = Gtk.Label(label="Titik hijau/oranye saat kamera atau mikrofon aktif dipakai aplikasi", xalign=0)
-        r_priv_d.get_style_context().add_class("row-desc")
-        r_priv_txt.pack_start(r_priv_t, False, False, 0)
-        r_priv_txt.pack_start(r_priv_d, False, False, 0)
-        r_priv_box.pack_start(r_priv_txt, True, True, 0)
-
-        self.switch_privacy = Gtk.Switch()
-        self.switch_privacy.set_valign(Gtk.Align.CENTER)
-        self.switch_privacy.set_active(getattr(self.controller, "standby_privacy", True))
-        self.switch_privacy.connect("notify::active", self._on_privacy_switch_toggled)
-        r_priv_box.pack_start(self.switch_privacy, False, False, 0)
-        card1.pack_start(r_priv_box, False, False, 2)
-
-        # Row 5: Monitor Selection
         r3_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         r3_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         r3_t = Gtk.Label(label="Layar Monitor", xalign=0)
@@ -8101,341 +8576,646 @@ class SettingsWindow(Gtk.Window):
         r3_txt.pack_start(r3_t, False, False, 0)
         r3_txt.pack_start(r3_d, False, False, 0)
         r3_box.pack_start(r3_txt, True, True, 0)
-
         self.btn_mon = Gtk.Button(label=self.controller.monitor_mode_label)
         self.btn_mon.set_valign(Gtk.Align.CENTER)
         self.btn_mon.connect("clicked", self._on_monitor_clicked)
         r3_box.pack_start(self.btn_mon, False, False, 0)
         card1.pack_start(r3_box, False, False, 2)
 
-        main_box.pack_start(card1, False, False, 0)
+        page.pack_start(card1, False, False, 0)
+        self.stack.add_named(scrolled, "standby")
 
-        # ---------------------------------------------------------
-        # Card 2: Lokasi & Wilayah (Sholat & Cuaca)
-        # ---------------------------------------------------------
-        card2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card2.get_style_context().add_class("settings-card")
+    def _build_finance_page(self):
+        scrolled, page = self._make_scrolled_page()
+        fin = getattr(self.controller, "finance", None)
+        self._updating_chips = False
+        self._preset_stock_syms = {s for s, _ in FinanceManager.INDONESIA_STOCK_PRESETS}
 
-        c2_head = Gtk.Label(xalign=0)
-        c2_head.get_style_context().add_class("section-header")
-        c2_head.set_text("LOKASI & WILAYAH (SHOLAT & CUACA)")
-        card2.pack_start(c2_head, False, False, 0)
+        # Card: IHSG + IDX Stocks
+        card_st = self._make_card("SAHAM INDONESIA (IDX)")
+        self.switch_fin_ihsg = self._make_switch_row(
+            card_st,
+            "Tampilkan Grafik IHSG (^JKSE)",
+            "Menampilkan kartu indeks IHSG beserta grafik intraday",
+            getattr(fin, "show_ihsg", True) if fin else True,
+            self._on_fin_ihsg_toggled,
+        )
 
-        r4_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r4_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r4_t = Gtk.Label(label="Pilihan Kota / Kabupaten", xalign=0)
-        r4_t.get_style_context().add_class("row-title")
-        r4_d = Gtk.Label(label="Lokasi jadwal sholat Kemenag & prakiraan Open-Meteo", xalign=0)
-        r4_d.get_style_context().add_class("row-desc")
-        r4_txt.pack_start(r4_t, False, False, 0)
-        r4_txt.pack_start(r4_d, False, False, 0)
-        r4_box.pack_start(r4_txt, True, True, 0)
+        self._stock_active_hdr, self._stock_active_clear, self._stock_active_flow, self._stock_warn = (
+            self._build_active_watchlist_bar(card_st, "Saham Tampil", self._on_clear_stocks)
+        )
 
-        self.combo_city = Gtk.ComboBoxText()
-        if self.controller.prayer:
-            for c in self.controller.prayer.CITIES:
-                self.combo_city.append(c["name"], c["name"])
-            self.combo_city.set_active_id(self.controller.prayer.current_city["name"])
-        self.combo_city.connect("changed", self._on_city_changed)
-        r4_box.pack_start(self.combo_city, False, False, 0)
-        card2.pack_start(r4_box, False, False, 2)
+        st_desc = Gtk.Label(label="Pilih dari daftar populer atau tambah kode emiten sendiri (maks. 4 tampil):", xalign=0)
+        st_desc.get_style_context().add_class("row-desc")
+        card_st.pack_start(st_desc, False, False, 0)
 
-        # Refresh Weather Button row
+        self.flow_stocks = Gtk.FlowBox()
+        self.flow_stocks.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flow_stocks.set_max_children_per_line(6)
+        self.flow_stocks.set_row_spacing(6)
+        self.flow_stocks.set_column_spacing(6)
+        self._stock_btns: Dict[str, Gtk.ToggleButton] = {}
+        self._stock_labels: Dict[str, str] = {}
+        cur_stocks = list(getattr(fin, "selected_stocks", [])) if fin else []
+        all_stock_items = list(FinanceManager.INDONESIA_STOCK_PRESETS)
+        for s in cur_stocks:
+            if s not in self._preset_stock_syms:
+                all_stock_items.append((s, s[:-3] if s.endswith(".JK") else s))
+        for sym, lbl in all_stock_items:
+            self._add_stock_chip(sym, lbl, sym in cur_stocks)
+        card_st.pack_start(self.flow_stocks, False, False, 2)
+
+        add_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.entry_custom_stock = Gtk.Entry()
+        self.entry_custom_stock.set_placeholder_text("Tambah kode emiten (misal: ADRO, PTBA, BBTN)")
+        self.entry_custom_stock.get_style_context().add_class("settings-entry")
+        self.entry_custom_stock.connect("activate", self._on_add_custom_stock)
+        add_box.pack_start(self.entry_custom_stock, True, True, 0)
+        btn_add_stock = Gtk.Button(label="+ Tambah")
+        btn_add_stock.connect("clicked", self._on_add_custom_stock)
+        add_box.pack_start(btn_add_stock, False, False, 0)
+        card_st.pack_start(add_box, False, False, 2)
+        page.pack_start(card_st, False, False, 0)
+
+        # Card: Currencies
+        card_cur = self._make_card("MATA UANG (KURS RUPIAH)")
+        self._curr_active_hdr, self._curr_active_clear, self._curr_active_flow, self._curr_warn = (
+            self._build_active_watchlist_bar(card_cur, "Kurs Tampil", self._on_clear_currencies)
+        )
+        cur_desc = Gtk.Label(label="Pilih mata uang yang ingin dipantau (maks. 4 tampil):", xalign=0)
+        cur_desc.get_style_context().add_class("row-desc")
+        card_cur.pack_start(cur_desc, False, False, 0)
+
+        flow_cur = Gtk.FlowBox()
+        flow_cur.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow_cur.set_max_children_per_line(5)
+        flow_cur.set_row_spacing(6)
+        flow_cur.set_column_spacing(6)
+        self._curr_btns: Dict[str, Gtk.ToggleButton] = {}
+        self._curr_labels: Dict[str, str] = {}
+        cur_currs = list(getattr(fin, "selected_currencies", [])) if fin else []
+        for sym, pair_lbl, _name_lbl in FinanceManager.CURRENCY_PRESETS:
+            self._curr_labels[sym] = pair_lbl
+            is_on = sym in cur_currs
+            tb = Gtk.ToggleButton(label=f"✓ {pair_lbl}" if is_on else pair_lbl)
+            tb.get_style_context().add_class("chip-toggle")
+            tb.set_active(is_on)
+            tb.connect("toggled", self._on_currency_chip_toggled, sym)
+            self._curr_btns[sym] = tb
+            flow_cur.add(tb)
+        card_cur.pack_start(flow_cur, False, False, 2)
+        page.pack_start(card_cur, False, False, 0)
+
+        # Card: Crypto
+        card_cry = self._make_card("KOIN CRYPTO")
+        self._crypto_active_hdr, self._crypto_active_clear, self._crypto_active_flow, self._crypto_warn = (
+            self._build_active_watchlist_bar(card_cry, "Crypto Tampil", self._on_clear_cryptos)
+        )
+        cry_desc = Gtk.Label(label="Pilih koin crypto yang ingin ditampilkan (maks. 4 tampil):", xalign=0)
+        cry_desc.get_style_context().add_class("row-desc")
+        card_cry.pack_start(cry_desc, False, False, 0)
+
+        flow_cry = Gtk.FlowBox()
+        flow_cry.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow_cry.set_max_children_per_line(5)
+        flow_cry.set_row_spacing(6)
+        flow_cry.set_column_spacing(6)
+        self._crypto_btns: Dict[str, Gtk.ToggleButton] = {}
+        self._crypto_labels: Dict[str, str] = {}
+        cur_cryptos = list(getattr(fin, "selected_cryptos", [])) if fin else []
+        for cid, ticker, _ysym in FinanceManager.CRYPTO_PRESETS:
+            self._crypto_labels[cid] = ticker
+            is_on = cid in cur_cryptos
+            tb = Gtk.ToggleButton(label=f"✓ {ticker}" if is_on else ticker)
+            tb.get_style_context().add_class("chip-toggle")
+            tb.set_active(is_on)
+            tb.connect("toggled", self._on_crypto_chip_toggled, cid)
+            self._crypto_btns[cid] = tb
+            flow_cry.add(tb)
+        card_cry.pack_start(flow_cry, False, False, 2)
+
+        btn_fin_sync = Gtk.Button(label="⟳ Segarkan Data Pasar Sekarang")
+        btn_fin_sync.get_style_context().add_class("action-btn")
+        btn_fin_sync.connect("clicked", self._on_fin_refresh_clicked)
+        card_cry.pack_start(btn_fin_sync, False, False, 4)
+        page.pack_start(card_cry, False, False, 0)
+
+        self._refresh_finance_active_bars()
+        self.stack.add_named(scrolled, "finance")
+
+    def _build_active_watchlist_bar(self, parent_card: Gtk.Box, title: str, on_clear_cb):
+        hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hdr_lbl = Gtk.Label(label=f"{title} (0/4)", xalign=0)
+        hdr_lbl.get_style_context().add_class("row-title")
+        hdr_row.pack_start(hdr_lbl, True, True, 0)
+
+        btn_clear = Gtk.Button(label="Kosongkan")
+        btn_clear.get_style_context().add_class("clear-link-btn")
+        btn_clear.connect("clicked", on_clear_cb)
+        hdr_row.pack_end(btn_clear, False, False, 0)
+        parent_card.pack_start(hdr_row, False, False, 0)
+
+        flow_active = Gtk.FlowBox()
+        flow_active.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow_active.set_max_children_per_line(5)
+        flow_active.set_row_spacing(6)
+        flow_active.set_column_spacing(6)
+        parent_card.pack_start(flow_active, False, False, 2)
+
+        warn_lbl = Gtk.Label(label="", xalign=0)
+        warn_lbl.get_style_context().add_class("watchlist-warn")
+        warn_lbl.set_no_show_all(True)
+        warn_lbl.hide()
+        parent_card.pack_start(warn_lbl, False, False, 0)
+        return hdr_lbl, btn_clear, flow_active, warn_lbl
+
+    def _populate_active_flow(self, flow_box: Gtk.FlowBox, hdr_lbl: Gtk.Label, btn_clear: Gtk.Button, title: str, items: List[Tuple[str, str]], on_remove_cb):
+        for child in list(flow_box.get_children()):
+            flow_box.remove(child)
+        count = len(items)
+        hdr_lbl.set_text(f"{title} ({count}/4)")
+        btn_clear.set_visible(count > 0)
+        if count == 0:
+            empty_lbl = Gtk.Label(label="Belum ada yang ditampilkan (pilih item di bawah)", xalign=0)
+            empty_lbl.get_style_context().add_class("row-desc")
+            flow_box.add(empty_lbl)
+            empty_lbl.show()
+            return
+        for key, disp in items:
+            pill = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            pill.get_style_context().add_class("active-pill")
+            lbl = Gtk.Label(label=disp)
+            lbl.get_style_context().add_class("active-pill-label")
+            pill.pack_start(lbl, False, False, 0)
+            rm = Gtk.Button(label="✕")
+            rm.get_style_context().add_class("active-pill-remove")
+            rm.set_tooltip_text(f"Hapus {disp} dari tampilan")
+            rm.connect("clicked", on_remove_cb, key)
+            pill.pack_start(rm, False, False, 0)
+            flow_box.add(pill)
+            pill.show_all()
+
+    def _sync_chip_group(self, btns: Dict[str, Gtk.ToggleButton], labels: Dict[str, str], active_keys: List[str]):
+        self._updating_chips = True
+        try:
+            active_set = set(active_keys)
+            for key, tb in btns.items():
+                is_on = key in active_set
+                tb.set_active(is_on)
+                base_lbl = labels.get(key, key)
+                tb.set_label(f"✓ {base_lbl}" if is_on else base_lbl)
+        finally:
+            self._updating_chips = False
+
+    def _refresh_finance_active_bars(self):
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        stocks = list(getattr(fin, "selected_stocks", []))
+        stock_items = [(s, self._stock_labels.get(s, s[:-3] if s.endswith(".JK") else s)) for s in stocks]
+        self._populate_active_flow(
+            self._stock_active_flow, self._stock_active_hdr, self._stock_active_clear,
+            "Saham Tampil", stock_items, self._on_remove_active_stock,
+        )
+        self._sync_chip_group(self._stock_btns, self._stock_labels, stocks)
+
+        currs = list(getattr(fin, "selected_currencies", []))
+        curr_items = [(c, self._curr_labels.get(c, c)) for c in currs]
+        self._populate_active_flow(
+            self._curr_active_flow, self._curr_active_hdr, self._curr_active_clear,
+            "Kurs Tampil", curr_items, self._on_remove_active_currency,
+        )
+        self._sync_chip_group(self._curr_btns, self._curr_labels, currs)
+
+        cryptos = list(getattr(fin, "selected_cryptos", []))
+        crypto_items = [(c, self._crypto_labels.get(c, c.upper())) for c in cryptos]
+        self._populate_active_flow(
+            self._crypto_active_flow, self._crypto_active_hdr, self._crypto_active_clear,
+            "Crypto Tampil", crypto_items, self._on_remove_active_crypto,
+        )
+        self._sync_chip_group(self._crypto_btns, self._crypto_labels, cryptos)
+
+    def _show_watchlist_warn(self, warn_lbl: Gtk.Label, msg: str):
+        if msg:
+            warn_lbl.set_text(msg)
+            warn_lbl.show()
+        else:
+            warn_lbl.hide()
+
+    def _add_stock_chip(self, sym: str, label_txt: str, active: bool):
+        self._stock_labels[sym] = label_txt
+        if sym in self._stock_btns:
+            self._updating_chips = True
+            try:
+                self._stock_btns[sym].set_active(active)
+                self._stock_btns[sym].set_label(f"✓ {label_txt}" if active else label_txt)
+            finally:
+                self._updating_chips = False
+            return
+        tb = Gtk.ToggleButton(label=f"✓ {label_txt}" if active else label_txt)
+        tb.get_style_context().add_class("chip-toggle")
+        tb.set_active(active)
+        tb.connect("toggled", self._on_stock_chip_toggled, sym)
+        self._stock_btns[sym] = tb
+        self.flow_stocks.add(tb)
+        tb.show()
+
+    def _schedule_finance_refresh(self):
+        self.controller._save_settings()
+        if self._fin_refresh_timer is not None:
+            try:
+                GLib.source_remove(self._fin_refresh_timer)
+            except Exception:
+                pass
+        self._fin_refresh_timer = GLib.timeout_add(450, self._run_finance_refresh)
+        self.controller.render_all()
+
+    def _run_finance_refresh(self):
+        self._fin_refresh_timer = None
+        if hasattr(self.controller, "finance") and self.controller.finance:
+            self.controller.finance.fetch_online()
+        return False
+
+    def _on_fin_ihsg_toggled(self, switch, _gparam):
+        if hasattr(self.controller, "finance") and self.controller.finance:
+            self.controller.finance.show_ihsg = switch.get_active()
+            self._schedule_finance_refresh()
+            self.controller.trigger_animation()
+
+    def _on_stock_chip_toggled(self, btn, sym: str):
+        if self._updating_chips:
+            return
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        active = btn.get_active()
+        if active:
+            if sym not in fin.selected_stocks:
+                if len(fin.selected_stocks) >= 4:
+                    self._updating_chips = True
+                    try:
+                        btn.set_active(False)
+                    finally:
+                        self._updating_chips = False
+                    self._show_watchlist_warn(
+                        self._stock_warn,
+                        "Maksimal 4 saham tampil! Hapus salah satu (klik ✕) terlebih dahulu.",
+                    )
+                    return
+                fin.selected_stocks.append(sym)
+                self._show_watchlist_warn(self._stock_warn, "")
+        else:
+            fin.selected_stocks = [s for s in fin.selected_stocks if s != sym]
+            self._show_watchlist_warn(self._stock_warn, "")
+            if sym not in self._preset_stock_syms and sym in self._stock_btns:
+                child = self._stock_btns.pop(sym)
+                parent = child.get_parent()
+                if parent is not None:
+                    self.flow_stocks.remove(parent)
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_remove_active_stock(self, _btn, sym: str):
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        fin.selected_stocks = [s for s in fin.selected_stocks if s != sym]
+        if sym not in self._preset_stock_syms and sym in self._stock_btns:
+            child = self._stock_btns.pop(sym)
+            parent = child.get_parent()
+            if parent is not None:
+                self.flow_stocks.remove(parent)
+        self._show_watchlist_warn(self._stock_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_clear_stocks(self, _btn):
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        fin.selected_stocks = []
+        for sym in list(self._stock_btns.keys()):
+            if sym not in self._preset_stock_syms:
+                child = self._stock_btns.pop(sym)
+                parent = child.get_parent()
+                if parent is not None:
+                    self.flow_stocks.remove(parent)
+        self._show_watchlist_warn(self._stock_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_add_custom_stock(self, _widget):
+        raw = self.entry_custom_stock.get_text().strip().upper()
+        if not raw:
+            return
+        sym = raw if (raw.endswith(".JK") or raw.startswith("^")) else f"{raw}.JK"
+        lbl = sym[:-3] if sym.endswith(".JK") else sym
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        if sym in fin.selected_stocks:
+            self._show_watchlist_warn(self._stock_warn, f"{lbl} sudah ada di daftar saham tampil.")
+            self.entry_custom_stock.set_text("")
+            return
+        if len(fin.selected_stocks) >= 4:
+            self._show_watchlist_warn(
+                self._stock_warn,
+                f"Maksimal 4 saham tampil! Hapus salah satu (klik ✕) sebelum menambah {lbl}.",
+            )
+            return
+        self._show_watchlist_warn(self._stock_warn, "")
+        self._add_stock_chip(sym, lbl, True)
+        fin.selected_stocks.append(sym)
+        self.entry_custom_stock.set_text("")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_currency_chip_toggled(self, btn, sym: str):
+        if self._updating_chips:
+            return
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        if btn.get_active():
+            if sym not in fin.selected_currencies:
+                if len(fin.selected_currencies) >= 4:
+                    self._updating_chips = True
+                    try:
+                        btn.set_active(False)
+                    finally:
+                        self._updating_chips = False
+                    self._show_watchlist_warn(
+                        self._curr_warn,
+                        "Maksimal 4 mata uang tampil! Hapus salah satu (klik ✕) terlebih dahulu.",
+                    )
+                    return
+                fin.selected_currencies.append(sym)
+                self._show_watchlist_warn(self._curr_warn, "")
+        else:
+            fin.selected_currencies = [c for c in fin.selected_currencies if c != sym]
+            self._show_watchlist_warn(self._curr_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_remove_active_currency(self, _btn, sym: str):
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        fin.selected_currencies = [c for c in fin.selected_currencies if c != sym]
+        self._show_watchlist_warn(self._curr_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_clear_currencies(self, _btn):
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        fin.selected_currencies = []
+        self._show_watchlist_warn(self._curr_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_crypto_chip_toggled(self, btn, cid: str):
+        if self._updating_chips:
+            return
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        if btn.get_active():
+            if cid not in fin.selected_cryptos:
+                if len(fin.selected_cryptos) >= 4:
+                    self._updating_chips = True
+                    try:
+                        btn.set_active(False)
+                    finally:
+                        self._updating_chips = False
+                    self._show_watchlist_warn(
+                        self._crypto_warn,
+                        "Maksimal 4 koin crypto tampil! Hapus salah satu (klik ✕) terlebih dahulu.",
+                    )
+                    return
+                fin.selected_cryptos.append(cid)
+                self._show_watchlist_warn(self._crypto_warn, "")
+        else:
+            fin.selected_cryptos = [c for c in fin.selected_cryptos if c != cid]
+            self._show_watchlist_warn(self._crypto_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_remove_active_crypto(self, _btn, cid: str):
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        fin.selected_cryptos = [c for c in fin.selected_cryptos if c != cid]
+        self._show_watchlist_warn(self._crypto_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_clear_cryptos(self, _btn):
+        fin = getattr(self.controller, "finance", None)
+        if not fin:
+            return
+        fin.selected_cryptos = []
+        self._show_watchlist_warn(self._crypto_warn, "")
+        self._refresh_finance_active_bars()
+        self._schedule_finance_refresh()
+
+    def _on_fin_refresh_clicked(self, _btn):
+        if hasattr(self.controller, "finance") and self.controller.finance:
+            self.controller.finance.fetch_online()
+
+    def _build_prayer_page(self):
+        scrolled, page = self._make_scrolled_page()
+        card2 = self._make_card("LOKASI & WILAYAH (SHOLAT & CUACA)")
+
+        cities = [(c["name"], c["name"]) for c in self.controller.prayer.CITIES] if self.controller.prayer else []
+        cur_city = self.controller.prayer.current_city["name"] if self.controller.prayer else ""
+        self.combo_city = self._make_combo_row(
+            card2,
+            "Pilihan Kota / Kabupaten",
+            "Lokasi jadwal sholat Kemenag & prakiraan Open-Meteo",
+            cities,
+            cur_city,
+            self._on_city_changed,
+        )
+
         r4b_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.lbl_prayer_info = Gtk.Label(xalign=0)
         self.lbl_prayer_info.get_style_context().add_class("row-desc")
         self._update_prayer_summary()
         r4b_box.pack_start(self.lbl_prayer_info, True, True, 0)
-
         btn_sync = Gtk.Button(label="Segarkan Cuaca")
         btn_sync.set_valign(Gtk.Align.CENTER)
         btn_sync.connect("clicked", self._on_refresh_weather_clicked)
         r4b_box.pack_start(btn_sync, False, False, 0)
         card2.pack_start(r4b_box, False, False, 2)
 
-        # Row 4c: Adzan Vibration Duration
-        r_vib_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r_vib_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r_vib_t = Gtk.Label(label="Durasi Getar & Banner Adzan", xalign=0)
-        r_vib_t.get_style_context().add_class("row-title")
-        r_vib_d = Gtk.Label(label="Lama waktu getaran dan banner penuh saat adzan tiba", xalign=0)
-        r_vib_d.get_style_context().add_class("row-desc")
-        r_vib_txt.pack_start(r_vib_t, False, False, 0)
-        r_vib_txt.pack_start(r_vib_d, False, False, 0)
-        r_vib_box.pack_start(r_vib_txt, True, True, 0)
+        sec_items = [(str(s), f"{s} detik (Default)" if s == 10 else f"{s} detik") for s in [5, 10, 15, 20, 30]]
+        self.combo_adzan_sec = self._make_combo_row(
+            card2,
+            "Durasi Getar & Banner Adzan",
+            "Lama waktu getaran dan banner penuh saat adzan tiba",
+            sec_items,
+            str(self.controller.adzan_vibration_sec),
+            self._on_adzan_sec_changed,
+        )
 
-        self.combo_adzan_sec = Gtk.ComboBoxText()
-        for sec in [5, 10, 15, 20, 30]:
-            lbl = f"{sec} detik (Default)" if sec == 10 else f"{sec} detik"
-            self.combo_adzan_sec.append(str(sec), lbl)
-        self.combo_adzan_sec.set_active_id(str(self.controller.adzan_vibration_sec))
-        self.combo_adzan_sec.connect("changed", self._on_adzan_sec_changed)
-        r_vib_box.pack_start(self.combo_adzan_sec, False, False, 0)
-        card2.pack_start(r_vib_box, False, False, 2)
+        page.pack_start(card2, False, False, 0)
+        self.stack.add_named(scrolled, "prayer")
 
-        main_box.pack_start(card2, False, False, 0)
+    def _build_health_page(self):
+        scrolled, page = self._make_scrolled_page()
+        card_health = self._make_card("KESEHATAN & ERGONOMI KERJA")
 
-        # ---------------------------------------------------------
-        # Card Health: Kesehatan Kerja & Ergonomi
-        # ---------------------------------------------------------
-        card_health = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card_health.get_style_context().add_class("settings-card")
+        self.switch_health_eye = self._make_switch_row(
+            card_health,
+            "Pengingat Istirahat Mata (Aturan 20-20-20)",
+            "Setiap 20 menit, istirahatkan mata 20 detik menatap jarak 6 meter",
+            getattr(self.controller.health, "eye_enabled", True) if hasattr(self.controller, "health") else True,
+            self._on_health_eye_toggled,
+        )
+        self.switch_health_stretch = self._make_switch_row(
+            card_health,
+            "Pengingat Berdiri & Peregangan (50 Menit)",
+            "Cegah duduk terlalu lama dengan berdiri atau berjalan ringan",
+            getattr(self.controller.health, "stretch_enabled", True) if hasattr(self.controller, "health") else True,
+            self._on_health_stretch_toggled,
+        )
+        self.switch_health_idle = self._make_switch_row(
+            card_health,
+            "Jeda Otomatis Saat Ditinggal (> 5 Menit)",
+            "Timer otomatis di-reset jika Anda sedang beranjak dari meja kerja",
+            getattr(self.controller.health, "smart_idle_pause", True) if hasattr(self.controller, "health") else True,
+            self._on_health_idle_toggled,
+        )
 
-        ch_head = Gtk.Label(xalign=0)
-        ch_head.get_style_context().add_class("section-header")
-        ch_head.set_text("KESEHATAN & ERGONOMI KERJA")
-        card_health.pack_start(ch_head, False, False, 0)
+        page.pack_start(card_health, False, False, 0)
+        self.stack.add_named(scrolled, "health")
 
-        # Row H1: Eye break (20-20-20)
-        rh1_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        rh1_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        rh1_t = Gtk.Label(label="Pengingat Istirahat Mata (Aturan 20-20-20)", xalign=0)
-        rh1_t.get_style_context().add_class("row-title")
-        rh1_d = Gtk.Label(label="Setiap 20 menit, istirahatkan mata 20 detik menatap jarak 6 meter", xalign=0)
-        rh1_d.get_style_context().add_class("row-desc")
-        rh1_txt.pack_start(rh1_t, False, False, 0)
-        rh1_txt.pack_start(rh1_d, False, False, 0)
-        rh1_box.pack_start(rh1_txt, True, True, 0)
+    def _build_quotes_page(self):
+        scrolled, page = self._make_scrolled_page()
+        card_quote = self._make_card("KUTIPAN & MOTIVASI (QUOTES)")
 
-        self.switch_health_eye = Gtk.Switch()
-        self.switch_health_eye.set_valign(Gtk.Align.CENTER)
-        self.switch_health_eye.set_active(getattr(self.controller.health, "eye_enabled", True) if hasattr(self.controller, "health") else True)
-        self.switch_health_eye.connect("notify::active", self._on_health_eye_toggled)
-        rh1_box.pack_start(self.switch_health_eye, False, False, 0)
-        card_health.pack_start(rh1_box, False, False, 2)
-
-        # Row H2: Stretch break (50m)
-        rh2_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        rh2_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        rh2_t = Gtk.Label(label="Pengingat Berdiri & Peregangan (50 Menit)", xalign=0)
-        rh2_t.get_style_context().add_class("row-title")
-        rh2_d = Gtk.Label(label="Cegah duduk terlalu lama dengan berdiri atau berjalan ringan", xalign=0)
-        rh2_d.get_style_context().add_class("row-desc")
-        rh2_txt.pack_start(rh2_t, False, False, 0)
-        rh2_txt.pack_start(rh2_d, False, False, 0)
-        rh2_box.pack_start(rh2_txt, True, True, 0)
-
-        self.switch_health_stretch = Gtk.Switch()
-        self.switch_health_stretch.set_valign(Gtk.Align.CENTER)
-        self.switch_health_stretch.set_active(getattr(self.controller.health, "stretch_enabled", True) if hasattr(self.controller, "health") else True)
-        self.switch_health_stretch.connect("notify::active", self._on_health_stretch_toggled)
-        rh2_box.pack_start(self.switch_health_stretch, False, False, 0)
-        card_health.pack_start(rh2_box, False, False, 2)
-
-        # Row H3: Smart Idle Pause
-        rh3_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        rh3_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        rh3_t = Gtk.Label(label="Jeda Otomatis Saat Ditinggal (> 5 Menit)", xalign=0)
-        rh3_t.get_style_context().add_class("row-title")
-        rh3_d = Gtk.Label(label="Timer otomatis di-reset jika Anda sedang beranjak dari meja kerja", xalign=0)
-        rh3_d.get_style_context().add_class("row-desc")
-        rh3_txt.pack_start(rh3_t, False, False, 0)
-        rh3_txt.pack_start(rh3_d, False, False, 0)
-        rh3_box.pack_start(rh3_txt, True, True, 0)
-
-        self.switch_health_idle = Gtk.Switch()
-        self.switch_health_idle.set_valign(Gtk.Align.CENTER)
-        self.switch_health_idle.set_active(getattr(self.controller.health, "smart_idle_pause", True) if hasattr(self.controller, "health") else True)
-        self.switch_health_idle.connect("notify::active", self._on_health_idle_toggled)
-        rh3_box.pack_start(self.switch_health_idle, False, False, 0)
-        card_health.pack_start(rh3_box, False, False, 2)
-
-        main_box.pack_start(card_health, False, False, 0)
-
-        # ---------------------------------------------------------
-        # Card 2c: Kutipan & Motivasi (Quotes)
-        # ---------------------------------------------------------
-        card_quote = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card_quote.get_style_context().add_class("settings-card")
-
-        cq_head = Gtk.Label(xalign=0)
-        cq_head.get_style_context().add_class("section-header")
-        cq_head.set_text("KUTIPAN & MOTIVASI (QUOTES)")
-        card_quote.pack_start(cq_head, False, False, 0)
-
-        # Row Q1: Morning Quote
-        rq1_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        rq1_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        rq1_t = Gtk.Label(label="Quote Pagi Hari", xalign=0)
-        rq1_t.get_style_context().add_class("row-title")
-        rq1_d = Gtk.Label(label="Tampilkan kutipan inspiratif sekali di pagi hari (05:00 - 11:00)", xalign=0)
-        rq1_d.get_style_context().add_class("row-desc")
-        rq1_txt.pack_start(rq1_t, False, False, 0)
-        rq1_txt.pack_start(rq1_d, False, False, 0)
-        rq1_box.pack_start(rq1_txt, True, True, 0)
-
-        self.switch_quote_morning = Gtk.Switch()
-        self.switch_quote_morning.set_valign(Gtk.Align.CENTER)
-        self.switch_quote_morning.set_active(getattr(self.controller.quote_mgr, "morning_enabled", True) if hasattr(self.controller, "quote_mgr") else True)
-        self.switch_quote_morning.connect("notify::active", self._on_quote_morning_toggled)
-        rq1_box.pack_start(self.switch_quote_morning, False, False, 0)
-        card_quote.pack_start(rq1_box, False, False, 2)
-
-        # Row Q2: Eye Break Quote
-        rq2_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        rq2_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        rq2_t = Gtk.Label(label="Quote Setiap Istirahat Mata", xalign=0)
-        rq2_t.get_style_context().add_class("row-title")
-        rq2_d = Gtk.Label(label="Tampilkan kutipan setiap selesai sesi istirahat mata 20-20-20", xalign=0)
-        rq2_d.get_style_context().add_class("row-desc")
-        rq2_txt.pack_start(rq2_t, False, False, 0)
-        rq2_txt.pack_start(rq2_d, False, False, 0)
-        rq2_box.pack_start(rq2_txt, True, True, 0)
-
-        self.switch_quote_eye = Gtk.Switch()
-        self.switch_quote_eye.set_valign(Gtk.Align.CENTER)
-        self.switch_quote_eye.set_active(getattr(self.controller.quote_mgr, "eye_break_enabled", True) if hasattr(self.controller, "quote_mgr") else True)
-        self.switch_quote_eye.connect("notify::active", self._on_quote_eye_toggled)
-        rq2_box.pack_start(self.switch_quote_eye, False, False, 0)
-        card_quote.pack_start(rq2_box, False, False, 2)
-
-        # Row Q3: Category Selector
-        rq3_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        rq3_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        rq3_t = Gtk.Label(label="Kategori Quote", xalign=0)
-        rq3_t.get_style_context().add_class("row-title")
-        rq3_d = Gtk.Label(label="Pilih tema kutipan atau acak dari semua kategori", xalign=0)
-        rq3_d.get_style_context().add_class("row-desc")
-        rq3_txt.pack_start(rq3_t, False, False, 0)
-        rq3_txt.pack_start(rq3_d, False, False, 0)
-        rq3_box.pack_start(rq3_txt, True, True, 0)
-
-        self.combo_quote_cat = Gtk.ComboBoxText()
-        self.combo_quote_cat.set_valign(Gtk.Align.CENTER)
-        for cat_id, cat_label in QUOTE_CATEGORIES:
-            self.combo_quote_cat.append(cat_id, cat_label)
+        self.switch_quote_morning = self._make_switch_row(
+            card_quote,
+            "Quote Pagi Hari",
+            "Tampilkan kutipan inspiratif sekali di pagi hari (05:00 - 11:00)",
+            getattr(self.controller.quote_mgr, "morning_enabled", True) if hasattr(self.controller, "quote_mgr") else True,
+            self._on_quote_morning_toggled,
+        )
+        self.switch_quote_eye = self._make_switch_row(
+            card_quote,
+            "Quote Setiap Istirahat Mata",
+            "Tampilkan kutipan di dalam notch saat sesi istirahat mata 20-20-20",
+            getattr(self.controller.quote_mgr, "eye_break_enabled", True) if hasattr(self.controller, "quote_mgr") else True,
+            self._on_quote_eye_toggled,
+        )
         cur_qcat = getattr(self.controller.quote_mgr, "category", "random") if hasattr(self.controller, "quote_mgr") else "random"
-        self.combo_quote_cat.set_active_id(cur_qcat)
-        self.combo_quote_cat.connect("changed", self._on_quote_cat_changed)
-        rq3_box.pack_start(self.combo_quote_cat, False, False, 0)
-        card_quote.pack_start(rq3_box, False, False, 2)
+        self.combo_quote_cat = self._make_combo_row(
+            card_quote,
+            "Kategori Quote",
+            "Pilih tema kutipan atau acak dari semua kategori",
+            QUOTE_CATEGORIES,
+            cur_qcat,
+            self._on_quote_cat_changed,
+        )
 
-        main_box.pack_start(card_quote, False, False, 0)
+        page.pack_start(card_quote, False, False, 0)
+        self.stack.add_named(scrolled, "quotes")
 
-        # ---------------------------------------------------------
-        # Card 3: Integrasi Sistem & Pop-up
-        # ---------------------------------------------------------
-        card3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card3.get_style_context().add_class("settings-card")
+    def _build_bluetooth_page(self):
+        scrolled, page = self._make_scrolled_page()
+        card_bt = self._make_card("BLUETOOTH & BATERAI HEADSET")
 
-        c3_head = Gtk.Label(xalign=0)
-        c3_head.get_style_context().add_class("section-header")
-        c3_head.set_text("INTEGRASI SISTEM")
-        card3.pack_start(c3_head, False, False, 0)
+        self.switch_bt_battery = self._make_switch_row(
+            card_bt,
+            "Tampilkan Baterai Headset Bluetooth",
+            "Menampilkan persentase baterai perangkat audio Bluetooth di HUD koneksi, Control Center, dan header panel",
+            getattr(self.controller, "show_bt_battery", True),
+            self._on_bt_battery_toggled,
+        )
 
-        # Row 5: DND Switch
-        r5_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r5_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r5_t = Gtk.Label(label="Mode Jangan Ganggu (DND)", xalign=0)
-        r5_t.get_style_context().add_class("row-title")
-        r5_d = Gtk.Label(label="Sembunyikan pop-up banner notifikasi masuk di Notch", xalign=0)
-        r5_d.get_style_context().add_class("row-desc")
-        r5_txt.pack_start(r5_t, False, False, 0)
-        r5_txt.pack_start(r5_d, False, False, 0)
-        r5_box.pack_start(r5_txt, True, True, 0)
+        st_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.lbl_bt_status = Gtk.Label(xalign=0)
+        self.lbl_bt_status.get_style_context().add_class("row-desc")
+        st_row.pack_start(self.lbl_bt_status, True, True, 0)
+        btn_bt_ref = Gtk.Button(label="Segarkan")
+        btn_bt_ref.connect("clicked", self._on_bt_refresh_clicked)
+        st_row.pack_start(btn_bt_ref, False, False, 0)
+        btn_bt_test = Gtk.Button(label="🎧 Uji HUD (85%)")
+        btn_bt_test.connect("clicked", lambda b: self.controller.on_bluetooth_event("EDIFIER X2 Plus", True, 85))
+        st_row.pack_start(btn_bt_test, False, False, 0)
+        card_bt.pack_start(st_row, False, False, 2)
 
-        self.switch_dnd = Gtk.Switch()
-        self.switch_dnd.set_valign(Gtk.Align.CENTER)
-        self.switch_dnd.set_active(self.controller.dnd)
-        self.switch_dnd.connect("notify::active", self._on_dnd_switch_toggled)
-        r5_box.pack_start(self.switch_dnd, False, False, 0)
-        card3.pack_start(r5_box, False, False, 2)
+        self._update_bt_status_label()
+        page.pack_start(card_bt, False, False, 0)
+        self.stack.add_named(scrolled, "bluetooth")
 
-        # Row 6: KDE Native Popup Inhibit Switch
-        r6_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r6_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r6_t = Gtk.Label(label="Sembunyikan Pop-up Notifikasi Asli KDE", xalign=0)
-        r6_t.get_style_context().add_class("row-title")
-        r6_d = Gtk.Label(label="Cegah pop-up ganda dari notifikasi bawaan KDE Plasma", xalign=0)
-        r6_d.get_style_context().add_class("row-desc")
-        r6_txt.pack_start(r6_t, False, False, 0)
-        r6_txt.pack_start(r6_d, False, False, 0)
-        r6_box.pack_start(r6_txt, True, True, 0)
+    def _update_bt_status_label(self):
+        sc = getattr(self.controller, "system_ctrl", None)
+        if sc and sc.state.bluetooth_enabled and sc.state.bluetooth_device:
+            bat_s = f" ({sc.state.bluetooth_battery}%)" if sc.state.bluetooth_battery >= 0 else " (Baterai tidak dilaporkan)"
+            self.lbl_bt_status.set_text(f"Terhubung: {sc.state.bluetooth_device}{bat_s}")
+        elif sc and sc.state.bluetooth_enabled:
+            self.lbl_bt_status.set_text("Bluetooth aktif, belum ada perangkat terhubung")
+        else:
+            self.lbl_bt_status.set_text("Bluetooth tidak aktif")
 
-        self.switch_kde = Gtk.Switch()
-        self.switch_kde.set_valign(Gtk.Align.CENTER)
-        self.switch_kde.set_active(self.controller.kde_top_autohide)
-        self.switch_kde.connect("notify::active", self._on_kde_switch_toggled)
-        r6_box.pack_start(self.switch_kde, False, False, 0)
-        card3.pack_start(r6_box, False, False, 2)
+    def _on_bt_battery_toggled(self, switch, _gparam):
+        self.controller.show_bt_battery = switch.get_active()
+        self.controller._save_settings()
+        self.controller.render_all()
 
-        # Row 7: Hide on Fullscreen Switch
-        r7_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r7_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r7_t = Gtk.Label(label="Sembunyikan Saat Mode Fullscreen", xalign=0)
-        r7_t.get_style_context().add_class("row-title")
-        r7_d = Gtk.Label(label="Otomatis sembunyikan notch saat game atau video diputar layar penuh", xalign=0)
-        r7_d.get_style_context().add_class("row-desc")
-        r7_txt.pack_start(r7_t, False, False, 0)
-        r7_txt.pack_start(r7_d, False, False, 0)
-        r7_box.pack_start(r7_txt, True, True, 0)
+    def _on_bt_refresh_clicked(self, _btn):
+        if hasattr(self.controller, "system_ctrl") and self.controller.system_ctrl:
+            self.controller.system_ctrl.refresh_async()
+        GLib.timeout_add(400, lambda: (self._update_bt_status_label(), False)[1])
 
-        self.switch_fullscreen_hide = Gtk.Switch()
-        self.switch_fullscreen_hide.set_valign(Gtk.Align.CENTER)
-        self.switch_fullscreen_hide.set_active(getattr(self.controller, "hide_on_fullscreen", True))
-        self.switch_fullscreen_hide.connect("notify::active", self._on_fullscreen_hide_toggled)
-        r7_box.pack_start(self.switch_fullscreen_hide, False, False, 0)
-        card3.pack_start(r7_box, False, False, 2)
+    def _build_system_page(self):
+        scrolled, page = self._make_scrolled_page()
+        card3 = self._make_card("INTEGRASI SISTEM")
 
-        # Row 8: Autostart Switch
-        r8_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        r8_txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        r8_t = Gtk.Label(label="Jalankan Otomatis Saat Login (Autostart)", xalign=0)
-        r8_t.get_style_context().add_class("row-title")
-        r8_d = Gtk.Label(label="Aktifkan agar Pulo Notch otomatis berjalan saat komputer dinyalakan", xalign=0)
-        r8_d.get_style_context().add_class("row-desc")
-        r8_txt.pack_start(r8_t, False, False, 0)
-        r8_txt.pack_start(r8_d, False, False, 0)
-        r8_box.pack_start(r8_txt, True, True, 0)
+        self.switch_dnd = self._make_switch_row(
+            card3, "Mode Jangan Ganggu (DND)", "Sembunyikan pop-up banner notifikasi masuk di Notch",
+            self.controller.dnd, self._on_dnd_switch_toggled
+        )
+        self.switch_kde = self._make_switch_row(
+            card3, "Sembunyikan Pop-up Notifikasi Asli KDE", "Cegah pop-up ganda dari notifikasi bawaan KDE Plasma",
+            self.controller.kde_top_autohide, self._on_kde_switch_toggled
+        )
+        self.switch_fullscreen_hide = self._make_switch_row(
+            card3, "Sembunyikan Saat Mode Fullscreen", "Otomatis sembunyikan notch saat game atau video diputar layar penuh",
+            getattr(self.controller, "hide_on_fullscreen", True), self._on_fullscreen_hide_toggled
+        )
+        self.switch_autostart = self._make_switch_row(
+            card3, "Jalankan Otomatis Saat Login (Autostart)", "Aktifkan agar Pulo Notch otomatis berjalan saat komputer dinyalakan",
+            self.controller.is_autostart_enabled(), self._on_autostart_toggled
+        )
+        page.pack_start(card3, False, False, 0)
 
-        self.switch_autostart = Gtk.Switch()
-        self.switch_autostart.set_valign(Gtk.Align.CENTER)
-        self.switch_autostart.set_active(self.controller.is_autostart_enabled())
-        self.switch_autostart.connect("notify::active", self._on_autostart_toggled)
-        r8_box.pack_start(self.switch_autostart, False, False, 0)
-        card3.pack_start(r8_box, False, False, 2)
-
-        main_box.pack_start(card3, False, False, 0)
-
-        # ---------------------------------------------------------
-        # Card 4: Uji Coba & Aksi Cepat
-        # ---------------------------------------------------------
-        card4 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card4.get_style_context().add_class("settings-card")
-
-        c4_head = Gtk.Label(xalign=0)
-        c4_head.get_style_context().add_class("section-header")
-        c4_head.set_text("UJI COBA & AKSI")
-        card4.pack_start(c4_head, False, False, 0)
-
+        card4 = self._make_card("UJI COBA & AKSI")
         r7_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-
         btn_test_notif = Gtk.Button(label="🔔 Uji Notif")
         btn_test_notif.connect("clicked", lambda b: self.controller.send_test_notification(open_toast=True))
         r7_box.pack_start(btn_test_notif, True, True, 0)
-
         btn_test_adzan = Gtk.Button(label="🌙 Uji Adzan")
         btn_test_adzan.connect("clicked", lambda b: self.controller.trigger_test_adzan())
         r7_box.pack_start(btn_test_adzan, True, True, 0)
-
         btn_test_bt = Gtk.Button(label="🎧 Uji Bluetooth")
-        btn_test_bt.connect("clicked", lambda b: self.controller.on_bluetooth_event("EDIFIER X2 Plus", True))
+        btn_test_bt.connect("clicked", lambda b: self.controller.on_bluetooth_event("EDIFIER X2 Plus", True, 85))
         r7_box.pack_start(btn_test_bt, True, True, 0)
-
         btn_restart = Gtk.Button(label="🔄 Muat Ulang")
         btn_restart.connect("clicked", self._on_restart_clicked)
         r7_box.pack_start(btn_restart, True, True, 0)
-
         card4.pack_start(r7_box, False, False, 2)
 
         btn_quit = Gtk.Button(label="Keluar dari Pulo Notch")
         btn_quit.get_style_context().add_class("danger-btn")
         btn_quit.connect("clicked", lambda b: self.controller.quit())
         card4.pack_start(btn_quit, False, False, 2)
+        page.pack_start(card4, False, False, 0)
 
-        main_box.pack_start(card4, False, False, 0)
-
-        self.show_all()
+        self.stack.add_named(scrolled, "system")
 
     def _on_delete_event(self, widget, event):
         self.hide()
@@ -8834,6 +9614,19 @@ class NotchWindow(Gtk.Window):
                 self.target_h = 224.0
             elif self.active_tab == "control":
                 self.target_h = 264.0
+            elif self.active_tab == "finance":
+                fin = getattr(self.controller, "finance", None)
+                fdata = fin.data if fin else None
+                fh = 58.0
+                if getattr(fin, "show_ihsg", True):
+                    fh += 80.0
+                if fdata and fdata.stocks:
+                    fh += 50.0
+                if fdata and fdata.currencies:
+                    fh += 58.0
+                if fdata and fdata.btc:
+                    fh += 48.0
+                self.target_h = max(130.0, fh + 24.0)
             else:
                 self.target_h = float(self.PANEL_H)
         elif mode == "toast":
@@ -9171,6 +9964,7 @@ class NotchWindow(Gtk.Window):
             standby_finance=getattr(self.controller, "standby_finance", True),
             privacy=getattr(self.controller, "privacy", None),
             standby_privacy=getattr(self.controller, "standby_privacy", True),
+            show_bt_battery=getattr(self.controller, "show_bt_battery", True),
             audio_spectrum=self.controller.spectrum.bands if hasattr(self.controller, "spectrum") and self.controller.spectrum else None,
         )
 
@@ -9510,12 +10304,25 @@ class NotchWindow(Gtk.Window):
                 return True
             if "standby_battery" in self.hit_boxes and self.hit_boxes["standby_battery"].contains(pt):
                 bat = self.controller.battery
-                self.controller.on_hud_event(
-                    "battery",
-                    bat.capacity,
-                    False,
-                    extra_text=bat.detail_label,
-                )
+                sc = getattr(self.controller, "system_ctrl", None)
+                sc_state = getattr(sc, "state", sc)
+                show_bt = getattr(self.controller, "show_bt_battery", True)
+                bt_b = getattr(sc_state, "bluetooth_battery", -1) if (sc_state and getattr(sc_state, "bluetooth_enabled", False) and show_bt) else -1
+                if bt_b >= 0:
+                    self.controller.on_hud_event(
+                        "battery",
+                        bat.capacity,
+                        False,
+                        extra_text=f"Laptop {bat.capacity}%  •  Headset {bt_b}%",
+                        duration=3.0,
+                    )
+                else:
+                    self.controller.on_hud_event(
+                        "battery",
+                        bat.capacity,
+                        False,
+                        extra_text=bat.detail_label,
+                    )
                 return True
             default_tab = "music" if (self.controller.mpris and self.controller.mpris.is_playing) else "notifications"
             self.set_panel_open(True, tab=default_tab)
@@ -9788,6 +10595,7 @@ class DynamicIslandController:
         self.standby_lyrics = True
         self.standby_finance = True
         self.standby_privacy = True
+        self.show_bt_battery = True
         self.hide_on_fullscreen = True
         self._raw_fullscreen = False
         self.is_fullscreen_hidden = False
@@ -9795,6 +10603,8 @@ class DynamicIslandController:
         self.last_activity_time = time.time()
         self.quote_mgr = QuoteManager(self)
         self._load_settings()
+        if self.finance:
+            self.finance.fetch_online()
 
         self.rebuild_windows()
         self._last_monitors_signature = self._get_current_monitors_signature()
@@ -9827,7 +10637,7 @@ class DynamicIslandController:
         self.backlight_watcher = BacklightWatcher(self.on_hud_event)
         self.backlight_watcher.start()
 
-        self.bluetooth_watcher = BluetoothWatcher(self.on_bluetooth_event)
+        self.bluetooth_watcher = BluetoothWatcher(self.on_bluetooth_event, on_battery_callback=self._on_bt_battery_changed)
         self.bluetooth_watcher.start()
 
         self.last_cursor_pos: Tuple[int, int] = (960, 540)
@@ -10043,14 +10853,30 @@ class DynamicIslandController:
             for win in self.windows:
                 win.render_now()
 
-    def on_bluetooth_event(self, device_name: str, is_connected: bool):
+    def _on_bt_battery_changed(self):
+        if hasattr(self, "system_ctrl") and self.system_ctrl:
+            self.system_ctrl.refresh_async()
+        self.render_all()
+        return False
+
+    def on_bluetooth_event(self, device_name: str, is_connected: bool, battery_pct: int = -1):
+        show_bt_bat = getattr(self, "show_bt_battery", True)
+        if is_connected and battery_pct < 0 and hasattr(self, "bluetooth_watcher") and self.bluetooth_watcher:
+            _, bw_pct = self.bluetooth_watcher.get_connected_battery()
+            if bw_pct >= 0:
+                battery_pct = bw_pct
+        extra = f"{device_name}||{battery_pct}" if (show_bt_bat and is_connected and battery_pct >= 0) else device_name
         self.on_hud_event(
             "bluetooth",
-            100 if is_connected else 0,
+            battery_pct if (is_connected and battery_pct >= 0) else (100 if is_connected else 0),
             not is_connected,
-            extra_text=device_name,
+            extra_text=extra,
         )
+        if hasattr(self, "system_ctrl") and self.system_ctrl:
+            self.system_ctrl.refresh_async()
         summary = f"{device_name} Terhubung" if is_connected else f"{device_name} Terputus"
+        if is_connected and show_bt_bat and battery_pct >= 0:
+            summary = f"{device_name} Terhubung ({battery_pct}%)"
         body = (
             "Perangkat Bluetooth berhasil tersambung ke komputer."
             if is_connected
@@ -10413,10 +11239,19 @@ class DynamicIslandController:
                     self.standby_lyrics = cfg.get("standby_lyrics", True)
                     self.standby_finance = cfg.get("standby_finance", True)
                     self.standby_privacy = cfg.get("standby_privacy", True)
+                    self.show_bt_battery = cfg.get("show_bt_battery", True)
                     self.hide_on_fullscreen = cfg.get("hide_on_fullscreen", True)
                     self.adzan_vibration_sec = int(cfg.get("adzan_vibration_sec", 10))
                     if self.prayer:
                         self.prayer.adzan_vibration_sec = self.adzan_vibration_sec
+                    if hasattr(self, "finance") and self.finance:
+                        self.finance.show_ihsg = cfg.get("finance_show_ihsg", True)
+                        if "finance_stocks" in cfg and isinstance(cfg["finance_stocks"], list):
+                            self.finance.selected_stocks = [str(x) for x in cfg["finance_stocks"]][:4]
+                        if "finance_currencies" in cfg and isinstance(cfg["finance_currencies"], list):
+                            self.finance.selected_currencies = [str(x) for x in cfg["finance_currencies"]][:4]
+                        if "finance_cryptos" in cfg and isinstance(cfg["finance_cryptos"], list):
+                            self.finance.selected_cryptos = [str(x) for x in cfg["finance_cryptos"]][:4]
                     if hasattr(self, "health") and self.health:
                         self.health.eye_enabled = cfg.get("health_eye_enabled", True)
                         self.health.eye_interval_sec = float(cfg.get("health_eye_interval_min", 20)) * 60.0
@@ -10448,8 +11283,14 @@ class DynamicIslandController:
             cfg["standby_lyrics"] = self.standby_lyrics
             cfg["standby_finance"] = self.standby_finance
             cfg["standby_privacy"] = self.standby_privacy
+            cfg["show_bt_battery"] = getattr(self, "show_bt_battery", True)
             cfg["hide_on_fullscreen"] = self.hide_on_fullscreen
             cfg["adzan_vibration_sec"] = self.adzan_vibration_sec
+            if hasattr(self, "finance") and self.finance:
+                cfg["finance_show_ihsg"] = getattr(self.finance, "show_ihsg", True)
+                cfg["finance_stocks"] = list(getattr(self.finance, "selected_stocks", []))[:4]
+                cfg["finance_currencies"] = list(getattr(self.finance, "selected_currencies", []))[:4]
+                cfg["finance_cryptos"] = list(getattr(self.finance, "selected_cryptos", []))[:4]
             if hasattr(self, "health") and self.health:
                 cfg["health_eye_enabled"] = self.health.eye_enabled
                 cfg["health_eye_interval_min"] = int(self.health.eye_interval_sec / 60.0)
